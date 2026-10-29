@@ -1,0 +1,4 @@
+tanh form vs. sigmoid form: max difference 1.1e-16
+batch identity in float64, 64 inputs: log sides -112.389642061383 vs -112.389642061383; signs agree True
+tail bound |g - max(x,0)| <= phi(x): max ratio 0.998893 (must be <= 1)
+table sizes: [-20,20] 640 intervals, 12800 bytes; [-5,5] 3200 bytes

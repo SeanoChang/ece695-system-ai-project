@@ -1,0 +1,11 @@
+== Table
+intervals 160; table 3200 bytes; [-20, 20] version 12800 bytes
+sup |g''''| = 1.5957691216 (4/sqrt(2 pi) = 1.5957691216); interpolation bound h^4 sup/384 = 6.341e-08
+Delta range 3.56e-11 .. 1.98e-06
+dense check, 2000001 points: max |g - P| = 4.683e-07; max error / Delta = 0.867 (must be < 1)
+== Certification (share of outputs settled without recomputation)
+standard normal  FP16 99.56% (wrong 0), BF16 99.93% (wrong 0)
+uniform [-5, 5]  FP16 99.62% (wrong 0), BF16 99.90% (wrong 0)
+== Checksum mod 65537, blocks of 256
+one wrong output per block: 200000 trials, missed 0 (theory: never)
+two fixed wrong outputs: 20000000 trials, escaped 325, rate 1.62e-05 (bound 1/(p-1) = 1.53e-05)

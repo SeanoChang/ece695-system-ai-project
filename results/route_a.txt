@@ -1,0 +1,21 @@
+== FP32 inputs, FP16 outputs, blocks of 256
+fixed tolerance | false alarms (correct blocks) | random single bit flips caught
+           0.01 |                        91.55% |   96.7%
+            0.1 |                        41.50% |   74.5%
+            0.5 |                         8.71% |   45.1%
+              1 |                         4.15% |   32.5%
+              3 |                         0.75% |   14.4%
+             10 |                         0.01% |    0.8%
+rounding-aware tolerance (alpha x sum of propagated half-ulps)
+alpha         1 |                         0.74% |   34.2%
+alpha         2 |                         0.18% |   23.6%
+alpha         4 |                         0.01% |   13.8%
+== False alarms vs. block size (fixed tolerance 0.1)
+B =    32: 5.98%
+B =   256: 41.28%
+B =  1024: 80.10%
+== Output format and input precision (false alarms at tolerance 0.1 / 1 / 10)
+FP32 inputs    FP16: 41.67% / 4.12% / 0.00%
+FP32 inputs    BF16: 89.38% / 31.20% / 0.04%
+16-bit inputs  FP16: 42.72% / 9.23% / 9.17%
+16-bit inputs  BF16: 92.23% / 56.95% / 54.45%
