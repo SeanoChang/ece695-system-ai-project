@@ -218,6 +218,15 @@ All runs use fixed random seeds. Every figure is computed from a fresh run; no n
 The GPU notebook runs on Colab: Runtime → Change runtime type → T4 GPU, then Run all (about 5–10 minutes). It
 clones this repository to reuse the table construction.
 
+The GPU probe measures how accurate the real GELU kernel is, and how often Route B disagrees with it on clean
+data. It needs a CUDA GPU with PyTorch and Triton, and takes about a minute:
+
+```bash
+.venv/bin/pip install torch triton
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. .venv/bin/python scripts/gpu_probe.py
+PYTHONPATH=. .venv/bin/python scripts/gpu_probe.py --emulate    # CPU stand-in, no GPU needed
+```
+
 ## Layout
 
 ```
