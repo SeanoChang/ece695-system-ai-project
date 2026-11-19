@@ -1,0 +1,29 @@
+torch 2.14.1+cu130 | NVIDIA RTX A6000
+
+=== standard normal inputs, n = 4,194,304
+erf   error in FP32 ulps: max 1.02; above 0.5: 16.54%; above 1: 0.000%; above 2: 0
+erfc  error in FP32 ulps: max 4.02; above 0.5: 38.04%; above 1: 11.752%; above 2: 29522
+kernel                           | not correctly rounded | differs from torch F.gelu | max error / bound
+torch formula (erf)              |       882 (2.10e-04) |         0 (0.00e+00) |   0.62  (erf form: must be <= 1)
+torch F.gelu                     |       882 (2.10e-04) |         0 (0.00e+00) |   0.62  (erf form: must be <= 1)
+torch formula (erfc)             |       385 (9.18e-05) |       803 (1.91e-04) |   1.00
+triton (erf), notebook _gelu     |       721 (1.72e-04) |       422 (1.01e-04) |   0.62  (erf form: must be <= 1)
+triton (erfc), notebook _gelu2   |       385 (9.18e-05) |       803 (1.91e-04) |   1.00
+Route B margin                   | certified | certified but differs from torch F.gelu
+true value only (current)        |    99.57% | 448
+true value + kernel error bound  |    99.24% | 0
+erf form vs erfc form (the notebook's duplicate): differ on 803 (1.91e-04); among uncertified inputs 1.99%
+
+=== uniform [-5, 5] inputs, n = 4,194,304
+erf   error in FP32 ulps: max 1.03; above 0.5: 24.04%; above 1: 0.001%; above 2: 0
+erfc  error in FP32 ulps: max 4.03; above 0.5: 29.98%; above 1: 10.664%; above 2: 31498
+kernel                           | not correctly rounded | differs from torch F.gelu | max error / bound
+torch formula (erf)              |    334098 (7.97e-02) |         0 (0.00e+00) |   0.65  (erf form: must be <= 1)
+torch F.gelu                     |    334098 (7.97e-02) |         0 (0.00e+00) |   0.65  (erf form: must be <= 1)
+torch formula (erfc)             |       635 (1.51e-04) |    334067 (7.96e-02) |   1.00
+triton (erf), notebook _gelu     |    267249 (6.37e-02) |    196231 (4.68e-02) |   0.61  (erf form: must be <= 1)
+triton (erfc), notebook _gelu2   |       635 (1.51e-04) |    334067 (7.96e-02) |   1.00
+Route B margin                   | certified | certified but differs from torch F.gelu
+true value only (current)        |    99.61% | 327654
+true value + kernel error bound  |    80.69% | 0
+erf form vs erfc form (the notebook's duplicate): differ on 334067 (7.96e-02); among uncertified inputs 39.28%

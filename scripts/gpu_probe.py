@@ -4,7 +4,8 @@ Measures, on real GPU arithmetic:
   1. the error of CUDA erf / erfc in FP32 ulps;
   2. how often each GELU kernel's FP16 output is not correctly rounded;
   3. whether the kernels agree with each other bit for bit (PyTorch, formula, Triton, erfc form);
-  4. Route B: certified outputs that differ from the kernel, with the current and a kernel-aware margin.
+  4. Route B: certified outputs that differ from each kernel, for the two targets of route_b.certify;
+  5. whether Triton's erf and PyTorch's erf return the same FP32 bits.
 
 Usage: CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. .venv/bin/python scripts/gpu_probe.py     (about 1 minute)
        PYTHONPATH=. python scripts/gpu_probe.py --emulate                            (CPU stand-in, no GPU)
@@ -18,7 +19,7 @@ from gelucheck import route_b
 from gelucheck.formats import fp16_cell
 from gelucheck.gelu import gelu
 
-F32, U, C = np.float32, 2.0**-24, 0.7071067811865476
+F32, C = np.float32, 0.7071067811865476
 _erf, _erfc = np.frompyfunc(math.erf, 1, 1), np.frompyfunc(math.erfc, 1, 1)
 
 
@@ -49,16 +50,17 @@ def on_gpu(x):
             from triton.language.extra.cuda import libdevice
 
         @triton.jit
-        def k(x_ptr, y_ptr, y2_ptr, n, BLOCK: tl.constexpr):
+        def k(x_ptr, y_ptr, y2_ptr, e_ptr, n, BLOCK: tl.constexpr):
             offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
             m = offs < n
             v = tl.load(x_ptr + offs, mask=m, other=1.0)
             tl.store(y_ptr + offs, 0.5 * v * (1.0 + tl.erf(v * 0.7071067811865476)), mask=m)
             tl.store(y2_ptr + offs, 0.5 * v * libdevice.erfc(-v * 0.7071067811865476), mask=m)
+            tl.store(e_ptr + offs, tl.erf(v * 0.7071067811865476), mask=m)
 
-        y, y2 = torch.empty_like(t), torch.empty_like(t)
-        k[(triton.cdiv(t.numel(), 1024),)](t, y, y2, t.numel(), BLOCK=1024)
-        out["triton (erf), notebook _gelu"], out["triton (erfc), notebook _gelu2"] = y, y2
+        y, y2, e2 = torch.empty_like(t), torch.empty_like(t), torch.empty_like(t)
+        k[(triton.cdiv(t.numel(), 1024),)](t, y, y2, e2, t.numel(), BLOCK=1024)
+        out["triton (erf)"], out["triton (erfc)"], out["triton erf"] = y, y2, e2
     except Exception as err:                      # report and keep the PyTorch measurements
         print(f"  Triton kernel failed: {type(err).__name__}: {str(err)[:300]}")
     return {name: v.float().cpu().numpy() for name, v in out.items()}
@@ -79,28 +81,29 @@ def report(name, x, out, tab):
         ulp = np.abs(out[fn].astype(np.float64) - r) / np.spacing(np.abs(r).astype(F32)).astype(np.float64)
         print(f"{fn:5s} error in FP32 ulps: max {ulp.max():.2f}; above 0.5: {100 * (ulp > 0.5).mean():.2f}%; "
               f"above 1: {100 * (ulp > 1).mean():.3f}%; above 2: {int((ulp > 2).sum())}")
+    if "triton erf" in out:
+        de = out["triton erf"] != out["erf"]
+        ulps = np.abs(out["triton erf"].astype(np.float64) - out["erf"]) / np.spacing(np.abs(out["erf"]))
+        print(f"triton erf vs torch erf: FP32 bits differ on {int(de.sum())} ({de.mean():.2e}); max {ulps.max():.0f} ulp")
+    kernels = {k: v for k, v in out.items() if k not in ("erf", "erfc", "triton erf")}
     base = bits16(out["torch F.gelu"])
+    _, j = route_b.evaluate(tab, x)
+    ins = (x >= tab.lo) & (x < tab.hi)
     print("kernel                           | not correctly rounded | differs from torch F.gelu | max error / bound")
-    bound = 2 * U * np.abs(x64) + U * np.abs(g)           # 4U in (1 + erf), times |x|/2, plus the final rounding
-    for kname, y in out.items():
-        if kname in ("erf", "erfc"):
-            continue
+    for kname, y in kernels.items():
         b = bits16(y)
-        ratio = (np.abs(y.astype(np.float64) - g) / bound).max()
+        ratio = (np.abs(y.astype(np.float64) - g)[ins] / tab.kern32[j][ins]).max()
         print(f"{kname:32s} | {int((b != ref).sum()):9d} ({(b != ref).mean():.2e}) | {int((b != base).sum()):9d} "
               f"({(b != base).mean():.2e}) | {ratio:6.2f}{'' if 'erfc' in kname else '  (erf form: must be <= 1)'}")
-    p, j = route_b.evaluate(tab, x)
-    p64, d = p.astype(np.float64), tab.delta32[j].astype(np.float64)
-    pb, mlo, mhi = fp16_cell(p64)
-    inr = (x64 >= tab.lo) & (x64 < tab.hi) & (pb != 0) & (pb != 0x8000)
-    kern = 2 * U * np.abs(x64) + U * (np.abs(p64) + d)
-    print("Route B margin                   | certified | certified but differs from torch F.gelu")
-    for mname, marg in (("true value only (current)", d), ("true value + kernel error bound", d + kern)):
-        ok = inr & (p64 - marg > mlo) & (p64 + marg < mhi)
-        print(f"{mname:32s} | {100 * ok.mean():8.2f}% | {int((ok & (pb != base)).sum())}")
-    ok = inr & (p64 - d > mlo) & (p64 + d < mhi)
+    print("Route B target                   | certified | certified but differs from: "
+          + ", ".join(k for k in kernels if "erfc" not in k))
+    for target in ("exact", "kernel"):
+        ok, pb = route_b.certify(tab, x, "FP16", target)
+        miss = ", ".join(str(int((ok & (pb != bits16(y))).sum())) for k, y in kernels.items() if "erfc" not in k)
+        print(f"{target:32s} | {100 * ok.mean():8.2f}% | {miss}")
+    ok, _ = route_b.certify(tab, x, "FP16", "kernel")
     dup = bits16(out["torch formula (erf)"]) != bits16(out["torch formula (erfc)"])
-    print(f"erf form vs erfc form (the notebook's duplicate): differ on {int(dup.sum())} ({dup.mean():.2e}); "
+    print(f"erf form vs erfc form: differ on {int(dup.sum())} ({dup.mean():.2e}); "
           f"among uncertified inputs {100 * dup[~ok].mean():.2f}%")
 
 
