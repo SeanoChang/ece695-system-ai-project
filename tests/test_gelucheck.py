@@ -88,6 +88,15 @@ def test_evaluate_keeps_the_input_shape():
         assert not ok[0, 0, :3].any() and not ok[(x < -5) | (x >= 5)].any()
 
 
+def test_certify_needs_an_explicit_target():
+    tab = route_b.build(-5.0, 5.0, 1 / 16)
+    x = np.zeros(4, np.float32)
+    with pytest.raises(TypeError):
+        route_b.certify(tab, x, "FP16")
+    with pytest.raises(KeyError):
+        route_b.certify(tab, x, "FP16", "correct")
+
+
 def test_build_rejects_knots_that_are_not_exact():
     for lo, hi, h in ((-5.0, 5.0, 0.1), (-5.0, 5.03, 1 / 16), (-5.01, 5.0, 1 / 16)):
         with pytest.raises(ValueError):

@@ -73,16 +73,18 @@ def fig_route_b_certified(n):
     edges = np.linspace(-5, 5, 81)
     mid = (edges[:-1] + edges[1:]) / 2
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
-    for fmt, color, ls in (("FP16", BLUE, "-"), ("BF16", ORANGE, "--")):
-        ok, _ = route_b.certify(tab, x32, fmt)
-        idx = np.digitize(x32, edges) - 1
-        rate = [100 * ok[idx == i].mean() for i in range(len(mid))]
-        ax.plot(mid, rate, ls, color=color, lw=2, label=f"{fmt}: {100 * ok.mean():.2f}% overall")
-    ax.set_xlabel("input x")
+    idx = np.digitize(x32, edges) - 1
+    # colour = format, line style = target: solid for the real kernel, dotted for the correctly rounded GELU
+    for target, ls, lw, what in (("exact", ":", 1.6, "correctly rounded GELU"), ("kernel", "-", 2, "real FP32 kernel")):
+        for fmt, color in (("FP16", BLUE), ("BF16", ORANGE)):
+            ok, _ = route_b.certify(tab, x32, fmt, target)
+            rate = [100 * ok[idx == i].mean() for i in range(len(mid))]
+            ax.plot(mid, rate, ls, color=color, lw=lw, label=f"{fmt}, {what}: {100 * ok.mean():.1f}% overall")
+    ax.set_xlabel("input x (uniform over the table range)")
     ax.set_ylabel("outputs certified (%)")
-    ax.set_title("Route B settles almost every output without recomputing", fontsize=12, loc="left")
-    ax.set_ylim(95, 100.3)
-    ax.legend(frameon=False, loc="lower left")
+    ax.set_title("Route B certifies most outputs; the real kernel loses the left tail", fontsize=12, loc="left")
+    ax.set_ylim(0, 104)
+    ax.legend(frameon=False, loc="lower right", fontsize=9)
     save(fig, "route_b_certified.png")
 
 

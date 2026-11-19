@@ -123,6 +123,11 @@ outputs only: the second pass for the other outputs is a duplicate.
   kernel (246 of 400,000 for FP16 normal inputs, 59,757 for uniform inputs), so `exact` is not a safe reference
   for a real kernel. The uniform numbers drop because the kernel loses accuracy for x below about −3, where
   `1 + erf` cancels. Model inputs are close to normal, so the normal column is the one that matters.
+
+  ![Route B certification rate by input](figures/route_b_certified.png)
+
+  The figure shows where the loss is: for uniform inputs, the kernel target certifies almost nothing below about
+  x = −3.5 (solid lines), and the exact target certifies almost everything (dotted lines).
 - **The checksum works.** In 200,000 trials, every block with one wrong output was caught. For a fixed pair of
   wrong outputs, 325 of 20 million trials escaped (1.6 × 10⁻⁵). That is close to the theoretical bound
   2⁻¹⁶ ≈ 1.5 × 10⁻⁵.
@@ -151,7 +156,6 @@ of 2.25, so its certified shares (99.24% and 80.69%) are slightly above the tabl
 Two results shape the design. First, a checker that predicts the correctly rounded value raises false alarms
 on a correct kernel. Second, two compiled versions of the same formula give different bits, so a duplicate must
 be the same compiled code as the kernel that it checks.
-![Route B certification rate by input](figures/route_b_certified.png)
 
 ### Route A is the weak link
 
@@ -248,7 +252,7 @@ The proposal sources, slides and the gap brief are kept in the course notes, not
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 export PYTHONPATH=.:scripts
-.venv/bin/python -m pytest -q                      # 9 CPU tests, about 1 s (GPU tests skip without Triton)
+.venv/bin/python -m pytest -q                      # 10 CPU tests, about 1 s (GPU tests skip without Triton)
 .venv/bin/python scripts/run_route_b.py            # bound, certification, checksum (about 4 s)
 .venv/bin/python scripts/run_route_a.py            # tolerance trade-off, block size, formats
 .venv/bin/python scripts/check_proposal_math.py    # formulas from the proposal

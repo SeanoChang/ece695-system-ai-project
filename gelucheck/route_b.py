@@ -117,8 +117,11 @@ def evaluate(tab, x32):
     return p, j
 
 
-def certify(tab, x32, fmt, target="kernel"):
+def certify(tab, x32, fmt, target):
     """Returns (certified mask, predicted 16-bit encodings). Zero and sign-ambiguous cases are not certified.
+
+    target is "kernel" or "exact" (see the module docstring). It has no default: the two give different
+    predictions of what is safe, and a caller must say which reference it checks against.
 
     The cell test runs in FP32, operation for operation as in the GPU kernel. The cell midpoints are exact
     in FP32, and SLACK in the margin covers the rounding of the two subtractions.

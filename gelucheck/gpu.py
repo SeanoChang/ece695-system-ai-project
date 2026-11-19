@@ -331,6 +331,7 @@ class Bench:
         """Launch the kernels of one variant. Returns nothing: read counts() afterwards."""
         n, mode, f = x.numel(), VARIANTS.index(variant), faults
         assert n <= self.n and x.dtype == torch.float32 and y.dtype == torch.float16 and x.dim() == y.dim() == 1
+        assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
         assert fused or mode, "a separate checker needs a check"
         if mode:
             self.ctr.zero_()
@@ -349,6 +350,7 @@ class Bench:
         mode = MM_VARIANTS.index(variant)
         (M, K), N = a.shape, b.shape[1]
         assert M * N <= self.n and a.dtype == b.dtype == c.dtype == torch.float16
+        assert a.is_contiguous() and b.is_contiguous() and c.is_contiguous() and c.shape == (M, N)
         BM = 16 if M <= 16 else TILE
         if mode >= 2:
             self.ctr.zero_()
