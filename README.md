@@ -72,7 +72,7 @@ found no check that predicts the exact GELU output at a cost below running GELU 
 | Route | GELU variant | Idea | Cost per block |
 |---|---|---|---|
 | A | tanh approximation, `GELU(approximate='tanh')` | batch identity: `prod(x − y) = exp(−κ(Σx + cΣx³)) · prod(y)` | sums, products, one `exp` |
-| B | exact GELU, `x·Φ(x)` | a table of cubics predicts the exact 16-bit output; one checksum per block | one cubic per element, one checksum |
+| B | exact GELU, `x·Φ(x)` | a table of cubics predicts the 16-bit output of the kernel; one checksum per block | one cubic per element, one checksum |
 
 The proposal builds on Route B. Route A is kept as a negative result (see below).
 
@@ -81,11 +81,17 @@ The proposal builds on Route B. Route A is kept as a negative result (see below)
 1. **Offline table.** Split [−5, 5] into 160 intervals of width 1/16. On each, fit a cubic that matches GELU and
    its slope at both ends. Because `|g⁗| ≤ 4/√(2π)`, the fit error is below 6.35 × 10⁻⁸. Adding the FP32
    rounding of the evaluation gives a bound `Δⱼ` per interval. The table is 3.2 KB (12.8 KB for [−20, 20]).
-2. **Certify.** Evaluate the cubic to get `p`. The true value lies in `[p − Δⱼ, p + Δⱼ]`. If this window lies
-   inside one FP16 or BF16 rounding cell, that cell's value is provably the exact output. If not, an accurate
-   fallback decides. This is the fast-path-plus-fallback pattern of Ziv and RLIBM.
-3. **Check.** With random multipliers `rᵢ`, compute `D = Σ rᵢ (written bitsᵢ − predicted bitsᵢ) mod 65537` over a
-   block. If all outputs are right, `D = 0`. One wrong output always gives `D ≠ 0`. Several wrong outputs cancel
+2. **Certify.** Evaluate the cubic to get `p`. The true value lies in `[p − Δⱼ, p + Δⱼ]`. A real kernel computes
+   `0.5·x·(1 + erf(x/√2))` in FP32, and its output is not always the correctly rounded value. Its output lies
+   within `Kⱼ` of the true value, where `K = 2.25·U·|x| + U·|y|` and `U = 2⁻²⁴`. This follows from the FP32
+   operations and from NVIDIA's stated limit of 2 ulp for `erff`. If the window `[p − Δⱼ − Kⱼ, p + Δⱼ + Kⱼ]`
+   lies inside one FP16 or BF16 rounding cell, every output that such a kernel can produce rounds to that cell's
+   value. The prediction is then exact for any kernel inside the bound, whatever `erf` code it uses. If not,
+   the input is not certified, and a second run of the same kernel decides. This is the
+   fast-path-plus-fallback pattern of Ziv and RLIBM. `route_b.certify` has two targets: `"kernel"` (this one)
+   and `"exact"` (the correctly rounded GELU, margin `Δⱼ` only).
+3. **Check.** With random multipliers `rᵢ`, compute `D = Σ rᵢ (written bitsᵢ − predicted bitsᵢ) mod 65537` over the
+   certified outputs of a block. If all outputs are right, `D = 0`. One wrong output always gives `D ≠ 0`. Several wrong outputs cancel
    with probability at most 2⁻¹⁶ (2⁻³² with two checksums). If `D ≠ 0`, recompute the block.
 
 ![GELU, tanh GELU and the tail bound](figures/gelu.png)
@@ -95,7 +101,10 @@ FP32 inputs and FP16 or BF16 outputs. *Out:* faults in the inputs or in the chec
 approximation and SiLU (possible extensions); training.
 
 **Contribution.** The parts are known (fast path plus fallback, random checksums). Our contribution is the GELU
-checksum and its cost against duplication.
+checksum and its cost against duplication. Two properties separate it from duplication. A duplicate repeats a
+fault that comes from a defective unit, and the table does not. A duplicate matches only its own compiled code,
+and a certified prediction holds for every kernel inside the error bound. Both properties hold for certified
+outputs only: the second pass for the other outputs is a duplicate.
 
 ## Results so far (CPU, NumPy)
 
@@ -103,9 +112,17 @@ checksum and its cost against duplication.
 
 - **The bound holds.** At 2 million test points on [−5, 5], the largest measured error is 0.87 of the stored
   bound.
-- **Almost every output is settled without recomputation.** The table certifies 99.56% (FP16) and 99.93% (BF16)
-  of outputs for standard-normal inputs, and 99.62% and 99.90% for uniform inputs. There were 400,000 inputs per
-  test, and **no certified output was wrong**.
+- **Almost every output is settled without recomputation.** With 400,000 inputs per test:
+
+  | Target | FP16, normal | BF16, normal | FP16, uniform | BF16, uniform |
+  |---|---|---|---|---|
+  | `exact` (correctly rounded GELU) | 99.56% | 99.93% | 99.62% | 99.90% |
+  | `kernel` (the real FP32 kernel) | 99.15% | 99.87% | 80.23% | 86.33% |
+
+  No certified output differed from its target's reference. The `exact` predictions do differ from the modelled
+  kernel (246 of 400,000 for FP16 normal inputs, 59,757 for uniform inputs), so `exact` is not a safe reference
+  for a real kernel. The uniform numbers drop because the kernel loses accuracy for x below about −3, where
+  `1 + erf` cancels. Model inputs are close to normal, so the normal column is the one that matters.
 - **The checksum works.** In 200,000 trials, every block with one wrong output was caught. For a fixed pair of
   wrong outputs, 325 of 20 million trials escaped (1.6 × 10⁻⁵). That is close to the theoretical bound
   2⁻¹⁶ ≈ 1.5 × 10⁻⁵.
@@ -114,6 +131,26 @@ The written proposal quotes 99.57 / 99.94 / 99.91% and 326 escapes, from an earl
 which `scripts/run_route_b.py` reproduces.
 
 ![Route B error vs. bound](figures/route_b_bound.png)
+
+### First measurement on a GPU
+
+`scripts/gpu_probe.py` on an RTX A6000 (PyTorch 2.14.1, CUDA 13.0, Triton 3.8.0), 4.2 million inputs per
+distribution. Output: [`results/gpu_probe.txt`](results/gpu_probe.txt). That run used a bound with 2.0 in place
+of 2.25, so its certified shares (99.24% and 80.69%) are slightly above the table's.
+
+| Question | Normal inputs | Uniform inputs |
+|---|---|---|
+| Largest error of CUDA `erf` and `erfc`, in FP32 ulps | 1.02 and 4.02 | 1.03 and 4.03 |
+| PyTorch `F.gelu` outputs that are not the correctly rounded FP16 value | 882 (2.1 × 10⁻⁴) | 334,098 (8.0%) |
+| Largest kernel error, as a share of the bound with 2.0 | 0.62 | 0.65 |
+| `exact` predictions that differ from `F.gelu` (false alarms) | 448 | 327,654 |
+| Predictions with the kernel error bound that differ from `F.gelu` | 0 | 0 |
+| A Triton kernel of the same formula differs from `F.gelu` | 422 (1.0 × 10⁻⁴) | 196,231 (4.7%) |
+| The `erfc` form of GELU differs from `F.gelu` | 803 (1.9 × 10⁻⁴) | 334,067 (8.0%) |
+
+Two results shape the design. First, a checker that predicts the correctly rounded value raises false alarms
+on a correct kernel. Second, two compiled versions of the same formula give different bits, so a duplicate must
+be the same compiled code as the kernel that it checks.
 ![Route B certification rate by input](figures/route_b_certified.png)
 
 ### Route A is the weak link
@@ -140,10 +177,13 @@ Full outputs are in [`results/`](results/).
 
 ### What these results do not show
 
-- **GPU cost.** All runs above are on the CPU. The success criterion, lower latency than optimized duplication,
-  needs GPU kernels and timing.
-- **Real activations.** The inputs are synthetic (normal and uniform), not tensors captured from a model.
-- **Fault model.** Only output bit flips are tested, not faults inside the arithmetic.
+- **GPU cost.** No timing is measured yet. The success criterion, lower latency than optimized duplication,
+  needs the run of `scripts/run_gpu.py` on a GPU.
+- **Real activations.** The inputs above are synthetic (normal and uniform). `scripts/run_gpu.py` captures GELU
+  inputs from Pythia-410M and BERT; it is not run yet.
+- **Fault model.** The CPU runs test only output bit flips. The GPU run injects faults inside the arithmetic.
+- **A proof for `erf`.** NVIDIA's 2 ulp limit for `erff` comes from tests, not from a proof. The kernel error
+  bound depends on it. `scripts/run_gpu.py` tests every FP32 input in [−5, 5) on the GPU in use.
 - **Checker precision.** Route A's checker runs in float64 here. An FP32 checker would do worse.
 
 ## Evaluation plan and status
@@ -154,7 +194,8 @@ checksum is not cheaper, we report where the cost goes.
 **Workloads.** GELU inputs captured from the MLP layers of models that use exact GELU (Pythia-410M and BERT), plus
 synthetic normal and uniform inputs. GELU runs as its own kernel and fused at the end of the matrix-product kernel.
 
-**Baselines.** (a) Optimized duplication: GELU twice in one kernel, compared. (b) Direct bit comparison with the
+**Baselines.** (a) Optimized duplication: GELU twice in one kernel, compared. Both copies are the same compiled
+code; the compiler is stopped from merging them. (b) Direct bit comparison with the
 same certified values, without the checksum. (c) A range check. (d) No check, for the cost floor.
 
 **Metrics.** Detection rate per fault type and bit position, from injected single and multiple bit flips in the
@@ -164,16 +205,16 @@ latency against duplication.
 | Planned item | Status |
 |---|---|
 | Bound, certification and checksum on synthetic inputs (CPU) | Done: `scripts/run_route_b.py` |
-| Standalone GPU kernels: none, duplication, range check, Route B | Written in `gpu/gelu_gpu_bench.ipynb`, not run yet |
-| GELU fused into the matrix-multiply epilogue | Written in the notebook, not run yet |
-| Clean false alarms against the production (not correctly rounded) GELU kernel | Written in the notebook, not run yet |
-| **Block checksum `D mod 65537` on the GPU** | **Missing.** The GPU kernels compare each output bit for bit, which is baseline (b) |
-| Faults injected inside the GELU arithmetic | Missing. Only output bit flips are tested |
-| Detection rate per bit position, multiple bit flips | Missing |
-| GELU inputs captured from Pythia-410M and BERT | Missing. The notebook measures only GELU's share of GPU time |
+| Standalone GPU kernels: none, duplication, range check, Route B | Written: `gelucheck/gpu.py`. Tested in Triton's CPU interpreter. Not run on a GPU yet |
+| GELU fused into the matrix-multiply epilogue | Written (`k_mm`), tested in the interpreter, not run on a GPU yet |
+| Clean false alarms against the production (not correctly rounded) GELU kernel | Measured for the prediction alone (see above). Kernels: not run on a GPU yet |
+| Block checksum `D mod 65537` on the GPU | Written (`rb_sum`), tested against `route_b.checksum` in the interpreter |
+| Faults injected inside the GELU arithmetic | Written: `erf` result and output, in the first computation only or in every computation |
+| Detection rate per bit position, multiple bit flips | Written, by bit group; two faults in one block for the checksum |
+| GELU inputs captured from Pythia-410M and BERT | Written (`run_gpu.py`, experiment `models`), not run yet |
 | Model-level latency | Missing |
 
-**Resources.** One 16 GB GPU (Colab T4 or a course cluster GPU) and a model under 1 GB, a few GPU-hours in total.
+**Resources.** One GPU (an RTX A6000 on the ECN `dlm` server) and a model under 1 GB, a few GPU-hours in total.
 PyTorch, Triton and Hugging Face Transformers.
 
 ## Risks
@@ -181,8 +222,9 @@ PyTorch, Triton and Hugging Face Transformers.
 - **Duplication is already cheap.** A standalone GELU kernel mostly moves memory, so a second GELU may be nearly
   free. We measure the fused setting, where GELU shares the kernel with the matrix product.
 - **Fallback cost on the GPU.** Branches for the rare fallback inputs may cost more than their rate suggests. We
-  measure fallback divergence, and we can move fallback inputs to a separate pass (`gelu_rb_list` in the
-  notebook).
+  measure fallback divergence, and we can move fallback inputs to a separate pass (`rb_list` in
+  `gelucheck/gpu.py`). With 99.2% of inputs certified, almost every block of 1024 holds an uncertified input, so
+  a fallback for the whole block (`rb_block`) cannot win.
 
 ## How we chose this project
 
@@ -206,7 +248,7 @@ The proposal sources, slides and the gap brief are kept in the course notes, not
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 export PYTHONPATH=.:scripts
-.venv/bin/python -m pytest -q                      # 6 tests, about 1 s
+.venv/bin/python -m pytest -q                      # 9 CPU tests, about 1 s (GPU tests skip without Triton)
 .venv/bin/python scripts/run_route_b.py            # bound, certification, checksum (about 4 s)
 .venv/bin/python scripts/run_route_a.py            # tolerance trade-off, block size, formats
 .venv/bin/python scripts/check_proposal_math.py    # formulas from the proposal
@@ -215,17 +257,20 @@ export PYTHONPATH=.:scripts
 
 All runs use fixed random seeds. Every figure is computed from a fresh run; no numbers are typed in by hand.
 
-The GPU notebook runs on Colab: Runtime → Change runtime type → T4 GPU, then Run all (about 5–10 minutes). It
-clones this repository to reuse the table construction.
-
-The GPU probe measures how accurate the real GELU kernel is, and how often Route B disagrees with it on clean
-data. It needs a CUDA GPU with PyTorch and Triton, and takes about a minute:
+The GPU part needs a CUDA GPU with PyTorch, Triton and Transformers. Choose an idle GPU first:
 
 ```bash
-.venv/bin/pip install torch triton
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. .venv/bin/python scripts/gpu_probe.py
-PYTHONPATH=. .venv/bin/python scripts/gpu_probe.py --emulate    # CPU stand-in, no GPU needed
+.venv/bin/pip install torch triton transformers
+export CUDA_VISIBLE_DEVICES=2 PYTHONPATH=.
+.venv/bin/python -m pytest -q tests/test_gpu.py                       # kernels against the NumPy reference
+.venv/bin/python scripts/run_gpu.py | tee results/gpu.txt             # all GPU experiments, about 10 minutes
+.venv/bin/python scripts/gpu_probe.py | tee results/gpu_probe.txt     # accuracy of erf and of the GELU kernels
+.venv/bin/python scripts/gpu_probe.py --emulate                       # CPU stand-in for the probe, no GPU
 ```
+
+`run_gpu.py --only clean,inject` runs some experiments. Without a GPU, on Linux, `TRITON_INTERPRET=1` runs the
+same kernels in Triton's CPU interpreter: `pytest tests/test_gpu.py` and `run_gpu.py --quick` then test the
+logic, with no timing.
 
 ## Layout
 
@@ -233,14 +278,15 @@ PYTHONPATH=. .venv/bin/python scripts/gpu_probe.py --emulate    # CPU stand-in, 
 gelucheck/
   gelu.py      exact and tanh GELU, derivatives, accurate normal CDF
   formats.py   FP16 / BF16 rounding and rounding cells
-  route_b.py   table construction, FP32 evaluation, certification, checksum
+  route_b.py   table construction, kernel error bound, FP32 evaluation, certification, checksum
+  gpu.py       Triton kernels: GELU with each checker, fault injection, fused matmul
   route_a.py   batch-identity mismatch, block test, bit flips
 scripts/       experiments and figure generation
-tests/         property tests (identity, tail bound, BF16 rounding, bound, checksum)
+tests/         property tests (identity, tail bound, BF16 rounding, bound, checksum); test_gpu.py for the kernels
 results/       saved script outputs
 figures/       generated plots
 proposal/      original one-file checks behind the written proposal (replaced by scripts/)
-gpu/           Triton GPU benchmark notebook (Colab T4)
+docs/          known limits
 ```
 
 ## Background reading
