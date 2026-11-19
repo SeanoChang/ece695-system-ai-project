@@ -8,8 +8,8 @@ import math
 import numpy as np
 
 from gelucheck import route_b
-from gelucheck.formats import CELLS
-from gelucheck.gelu import d4gelu, gelu
+from gelucheck.formats import CELLS, round_bits
+from gelucheck.gelu import d4gelu, gelu, kernel_fp32
 
 
 def main():
@@ -26,6 +26,7 @@ def main():
     print(f"sup |g''''| = {sup:.10f} (4/sqrt(2 pi) = {4 / math.sqrt(2 * math.pi):.10f}); "
           f"interpolation bound h^4 sup/384 = {sup * tab.h**4 / 384:.3e}")
     print(f"Delta range {tab.delta32.min():.2e} .. {tab.delta32.max():.2e}")
+    print(f"kernel error bound range {tab.kern32.min():.2e} .. {tab.kern32.max():.2e}")
 
     xt = np.linspace(tab.lo, tab.hi - 1e-9, 2_000_001).astype(np.float32)
     p, j = route_b.evaluate(tab, xt)
@@ -34,17 +35,23 @@ def main():
           f"{(err / tab.delta32[j]).max():.3f} (must be < 1)")
 
     print("== Certification (share of outputs settled without recomputation)")
+    print("target exact: the correctly rounded GELU. target kernel: the FP32 kernel 0.5 x (1 + erf(x / sqrt 2)),")
+    print("modelled with erf 0 and 2 ulp off, with and without a fused multiply-add. 'differs' counts certified")
+    print("predictions that are not the reference's output (must be 0 for the target's own reference).")
     xn = rng.standard_normal(4 * args.n)
     inputs = {"standard normal": xn[(xn >= -5) & (xn < 5)][: args.n].astype(np.float32),
               "uniform [-5, 5]": rng.uniform(-5, 5, args.n).astype(np.float32)}
     for name, x32 in inputs.items():
         ref = gelu(x32.astype(np.float64))
-        row = []
-        for fmt in ("FP16", "BF16"):
-            ok, bits = route_b.certify(tab, x32, fmt)
-            ref_bits, _, _ = CELLS[fmt](ref)
-            row.append(f"{fmt} {100 * ok.mean():.2f}% (wrong {int((ok & (bits != ref_bits)).sum())})")
-        print(f"{name:16s} " + ", ".join(row))
+        models = [kernel_fp32(x32, shift, fma) for shift in (-2, 0, 2) for fma in (False, True)]
+        for target in ("exact", "kernel"):
+            row = []
+            for fmt in ("FP16", "BF16"):
+                ok, bits = route_b.certify(tab, x32, fmt, target)
+                d_exact = int((ok & (bits != CELLS[fmt](ref)[0])).sum())
+                d_kern = max(int((ok & (bits != round_bits(y, fmt))).sum()) for y in models)
+                row.append(f"{fmt} {100 * ok.mean():.2f}% (differs from exact {d_exact}, from kernel {d_kern})")
+            print(f"{name:16s} target {target:6s} " + ", ".join(row))
 
     print("== Checksum mod 65537, blocks of 256")
     trials, B = 200_000, 256

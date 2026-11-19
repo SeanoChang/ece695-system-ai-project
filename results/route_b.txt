@@ -2,10 +2,16 @@
 intervals 160; table 3200 bytes; [-20, 20] version 12800 bytes
 sup |g''''| = 1.5957691216 (4/sqrt(2 pi) = 1.5957691216); interpolation bound h^4 sup/384 = 6.341e-08
 Delta range 3.56e-11 .. 1.98e-06
+kernel error bound range 1.02e-08 .. 9.72e-07
 dense check, 2000001 points: max |g - P| = 4.683e-07; max error / Delta = 0.867 (must be < 1)
 == Certification (share of outputs settled without recomputation)
-standard normal  FP16 99.56% (wrong 0), BF16 99.93% (wrong 0)
-uniform [-5, 5]  FP16 99.62% (wrong 0), BF16 99.90% (wrong 0)
+target exact: the correctly rounded GELU. target kernel: the FP32 kernel 0.5 x (1 + erf(x / sqrt 2)),
+modelled with erf 0 and 2 ulp off, with and without a fused multiply-add. 'differs' counts certified
+predictions that are not the reference's output (must be 0 for the target's own reference).
+standard normal  target exact  FP16 99.56% (differs from exact 0, from kernel 246), BF16 99.93% (differs from exact 0, from kernel 40)
+standard normal  target kernel FP16 99.15% (differs from exact 0, from kernel 0), BF16 99.87% (differs from exact 0, from kernel 0)
+uniform [-5, 5]  target exact  FP16 99.62% (differs from exact 0, from kernel 59757), BF16 99.90% (differs from exact 0, from kernel 39296)
+uniform [-5, 5]  target kernel FP16 80.23% (differs from exact 0, from kernel 0), BF16 86.33% (differs from exact 0, from kernel 0)
 == Checksum mod 65537, blocks of 256
 one wrong output per block: 200000 trials, missed 0 (theory: never)
 two fixed wrong outputs: 20000000 trials, escaped 325, rate 1.62e-05 (bound 1/(p-1) = 1.53e-05)

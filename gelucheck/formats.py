@@ -44,5 +44,11 @@ def bf16_cell(v):
     return b.astype(np.uint16), (vv + lo) / 2, (vv + hi) / 2
 
 
+def round_bits(v32, fmt):
+    """16-bit encodings of FP32 values rounded to fmt (nearest, ties to even): what a kernel stores."""
+    v32 = np.asarray(v32, dtype=np.float32)
+    return v32.astype(np.float16).view(np.uint16) if fmt == "FP16" else bf16_bits(v32)
+
+
 CELLS = {"FP16": fp16_cell, "BF16": bf16_cell}
 ROUND = {"FP16": to_fp16, "BF16": to_bf16}

@@ -42,3 +42,20 @@ def gelu_tanh(x):
     """PyTorch GELU(approximate='tanh'), in the equivalent sigmoid form."""
     x = np.asarray(x, dtype=np.float64)
     return x / (1 + np.exp(-KAPPA * (x + C * x**3)))
+
+
+def kernel_fp32(x32, erf_shift=0, fma=False):
+    """FP32 model of the production kernel y = 0.5 x (1 + erf(x / sqrt 2)), as PyTorch and Triton compute it.
+
+    erf is correctly rounded to FP32 and then moved by erf_shift ulps, to model a library that is not
+    correctly rounded. With fma, the product and the sum are one fused operation (emulated in float64).
+    """
+    x32 = np.asarray(x32, dtype=np.float32)
+    z = (x32 * np.float32(1 / math.sqrt(2))).astype(np.float32)
+    e = _erf(z.astype(np.float64)).astype(np.float64).astype(np.float32)
+    for _ in range(abs(erf_shift)):
+        e = np.clip(np.nextafter(e, np.float32(math.copysign(2, erf_shift))), -1, 1).astype(np.float32)
+    a = (np.float32(0.5) * x32).astype(np.float32)
+    if fma:
+        return (a.astype(np.float64) * e.astype(np.float64) + a.astype(np.float64)).astype(np.float32)
+    return (a * (np.float32(1) + e).astype(np.float32)).astype(np.float32)
