@@ -32,6 +32,8 @@ unless the entry says so.
   run-time zero. A fault in the load of `x` reaches both copies.
 - **Text for the model inputs.** The `models` experiment feeds this repository's README to Pythia-410M and BERT.
   It is one text of one kind.
+- **The range check flags correct outputs for extreme inputs:** NaN, −∞, and x ≥ 65520, where the FP16 output
+  is +∞. No experiment gives such inputs to the range check, and FP16 activations cannot reach 65520.
 
 ## Route A
 

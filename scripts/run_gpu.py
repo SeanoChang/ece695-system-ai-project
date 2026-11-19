@@ -134,7 +134,8 @@ def exp_exhaustive(args):
         tot["crossdup"] += b.counts()["bad"]
         tot["n"] += n
     n = tot["n"]
-    print(f"\n{'SAMPLE of the' if args.quick else 'every'} FP32 input in [-5, 5): {n:,} values")
+    print(f"\n{'SAMPLE of the' if args.quick else 'every'} FP32 input in [-5, 5): {n:,} bit patterns "
+          f"(+0 and -0 both count)")
     print(f"  PyTorch F.gelu (FP32): max error / stored bound = {tot['ratio']:.3f} (must be <= 1)")
     print(f"  our kernel: FP16 outputs outside the bound = {tot['tri_out']} (must be 0)")
     print(f"  Route B certifies {100 * (1 - tot['unc'] / n):.2f}% of these values (a count of values, not of real inputs)")
@@ -242,7 +243,8 @@ def bench(fn, args):
 def exp_timing(args):
     """Standalone kernels, FP32 in and FP16 out. Sizes are tokens times the 4096-wide MLP of Pythia-410M."""
     print("\nEvery checked variant includes the reset of its 8-byte counters (one tiny launch).")
-    print("rb_list and rb_sum include the second pass. 'separate' is the time of the checker kernel alone.")
+    print("rb_list and rb_sum include the second pass. A 'separate' row is the time of the check without the GELU")
+    print("kernel: the checker kernel, its counter reset and, for rb_list and rb_sum, the second pass.")
     for tokens in (16,) if args.quick else (16, 512, 4096):
         n = tokens * 4096
         b = gpu.Bench(n)
@@ -271,17 +273,22 @@ def exp_matmul(args):
         c = torch.empty(M, N, dtype=torch.float16, device=DEV)
         b = gpu.Bench(M * N)
         print(f"\n  M = {M} tokens")
-        t = {}
+        t, note = {}, {}
         for v in gpu.MM_VARIANTS:
             try:
                 b.mm(v, a, w, c)
-                cnt = b.counts() if v not in ("matmul", "none") else {"bad": 0, "uncertified": 0}
+                if v not in ("matmul", "none"):      # these two have no check, so no counters
+                    cnt = b.counts()
+                    note[v] = f"   false alarms {cnt['bad']}, second pass / recomputed {cnt['uncertified']}"
                 t[v] = bench(lambda: b.mm(v, a, w, c), args)
-                base = t.get("none", float("nan"))
-                print(f"    {v:8s} {t[v] * 1e3:9.1f} us   x{t[v] / base:.3f} of matmul + GELU   "
-                      f"false alarms {cnt['bad']}, second pass / recomputed {cnt['uncertified']}")
             except Exception as err:                 # one variant that does not compile must not stop the rest
-                print(f"    {v:8s} failed: {type(err).__name__}: {str(err)[:200]}")
+                note[v] = f"failed: {type(err).__name__}: {str(err)[:200]}"
+        base = t.get("none", float("nan"))
+        for v in gpu.MM_VARIANTS:
+            if v in t:
+                print(f"    {v:8s} {t[v] * 1e3:9.1f} us   x{t[v] / base:.3f} of matmul + GELU{note.get(v, '')}")
+            else:
+                print(f"    {v:8s} {note[v]}")
 
 
 def capture(model, call):

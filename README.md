@@ -127,7 +127,7 @@ outputs only: the second pass for the other outputs is a duplicate.
   ![Route B certification rate by input](figures/route_b_certified.png)
 
   The figure shows where the loss is: for uniform inputs, the kernel target certifies almost nothing below about
-  x = −3.5 (solid lines), and the exact target certifies almost everything (dotted lines).
+  x = −3.5 for FP16 and −3.9 for BF16 (solid lines), and the exact target certifies almost everything (dotted lines).
 - **The checksum works.** In 200,000 trials, every block with one wrong output was caught. For a fixed pair of
   wrong outputs, 325 of 20 million trials escaped (1.6 × 10⁻⁵). That is close to the theoretical bound
   2⁻¹⁶ ≈ 1.5 × 10⁻⁵.
