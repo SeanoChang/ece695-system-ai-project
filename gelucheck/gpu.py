@@ -448,6 +448,7 @@ class Bench:
         assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
         assert fused or mode, "a separate checker needs a check"
         assert shift == 0 or not fused, "only a separate checker can check another block"
+        assert shift >= 0, "the kernel's signed remainder would give a negative block index"
         if mode:
             self.ctr.zero_()
         fe, fo, flag, d, ok, vb = (f.fe, f.fo, f.flag, f.d, f.ok, f.vb) if f else (self.i0,) * 6

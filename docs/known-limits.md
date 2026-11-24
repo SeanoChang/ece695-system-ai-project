@@ -47,6 +47,9 @@ unless the entry says so.
   prints the `list` stage next to `k_std` rb_list, which would show the gap.
 - **The matmul experiment times all variants in one call.** A variant that compiles and runs once but fails
   during timing stops the matmul experiment for that size; before `--repeat`, the other variants went on.
+- **No test covers the checksum's block index under a shift.** A separate `rb_sum` checker with `shift > 0`
+  stores each block's checksum at the block it checked; reverting that store to the program id passes every
+  test. No experiment runs a shifted `rb_sum`.
 - **The range check is slower than duplication** in the standalone kernel (×1.42 against ×1.36 at 4096 tokens).
   We did not look into why.
 - **The range check flags correct outputs for extreme inputs:** NaN, −∞, and x ≥ 65520, where the FP16 output
