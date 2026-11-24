@@ -264,7 +264,8 @@ def k_cost(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_pt
     0 none     GELU and store, as k_std "none"
     1 count    + the alarm counter: one atomic per block (the host also resets the counters)
     2 predict  + interval index, table loads and the cubic; every in-range output is compared with its
-               prediction (no cell test, so this stage flags the outputs it could not certify)
+               prediction (no cell test, so this stage flags the outputs whose prediction differs from the
+               stored output: a small part of the outputs it could not certify)
     3 cell     + the margin and the rounding-cell test; only certified outputs are compared
     4 append   + the append of uncertified inputs to the list: the code of k_std rb_list
                (stage 5, list, adds the second pass on the host)
@@ -448,7 +449,7 @@ class Bench:
         assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
         assert fused or mode, "a separate checker needs a check"
         assert shift == 0 or not fused, "only a separate checker can check another block"
-        assert shift >= 0, "the kernel's signed remainder would give a negative block index"
+        assert 0 <= shift < max(triton.cdiv(n, self.block), 1), "pid + shift must stay a valid int32 block index"
         if mode:
             self.ctr.zero_()
         fe, fo, flag, d, ok, vb = (f.fe, f.fo, f.flag, f.d, f.ok, f.vb) if f else (self.i0,) * 6

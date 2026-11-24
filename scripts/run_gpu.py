@@ -410,7 +410,7 @@ def exp_cost(args):
         t = bench_all(fns, args)
         base = t["none"].med
         print(f"\n  {tokens} tokens ({n:,} elements); alarms on clean data: 'predict' {alarms['predict']} (outputs "
-              f"it cannot certify), all other steps {sum(alarms.values()) - alarms['predict']}")
+              f"whose prediction differs; no cell test), all other steps {sum(alarms.values()) - alarms['predict']}")
         print(f"    {'step':48s} {'regs':>4s} {'time':>26s}   {'step cost (range)':>28s} {'of unprotected':>14s}")
         prev = None
         for s in gpu.COST_STAGES:

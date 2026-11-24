@@ -50,6 +50,14 @@ unless the entry says so.
 - **No test covers the checksum's block index under a shift.** A separate `rb_sum` checker with `shift > 0`
   stores each block's checksum at the block it checked; reverting that store to the program id passes every
   test. No experiment runs a shifted `rb_sum`.
+- **The interpreter's SM ids need `TRITON_INTERPRET=1` exactly.** Triton also accepts other true values, but
+  `gpu._SIM` tests for "1"; with another value every injection run stops with an InterpreterError.
+- **A ladder step's cost depends on the steps before it.** In a kernel limited by latency, the time one
+  part adds depends on what already runs. The cost experiment adds the parts in one order (counter, predict,
+  cell test, list, second pass); another order would split the same total differently.
+- **Separate checkers changed registers with the shift** (`a0c47a1`): on sm_86, the separate range check
+  went from 36 to 39 registers and separate `rb_block` from 56 to 51. Separate-checker timings from before
+  that commit and after it are not directly comparable. Fused builds are unchanged.
 - **The range check is slower than duplication** in the standalone kernel (×1.42 against ×1.36 at 4096 tokens).
   We did not look into why.
 - **The range check flags correct outputs for extreme inputs:** NaN, −∞, and x ≥ 65520, where the FP16 output
