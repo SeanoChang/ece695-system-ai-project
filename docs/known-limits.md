@@ -36,6 +36,13 @@ unless the entry says so.
   host-side NumPy on 2 million elements (`np.setdiff1d` and the bit copies in `tests/test_gpu.py:139-140`), not
   on the GPU. `results/pytest_gpu.txt` is copied from the terminal, with the repeated pytest frames of two
   stacks cut.
+- **The cost ladder carries its keep-alive terms.** Stages `count`, `load` and `poly` of `k_cost` keep their
+  work through a multiply by a run-time 0.0, a compare and an OR per element, and every later stage keeps
+  them. Each step therefore includes one such term. The experiment prints their total as the last step
+  minus `k_std` rb_list.
+- **No test sees a missing second pass in the `list` cost stage.** On clean data the second pass changes no
+  counter, so `Bench.cost("list")` without its `k_fallback` launch passes every test. The cost experiment
+  prints the `list` stage next to `k_std` rb_list, which would show the gap.
 - **The range check is slower than duplication** in the standalone kernel (×1.42 against ×1.36 at 4096 tokens).
   We did not look into why.
 - **The range check flags correct outputs for extreme inputs:** NaN, −∞, and x ≥ 65520, where the FP16 output

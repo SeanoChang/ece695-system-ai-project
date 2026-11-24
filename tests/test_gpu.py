@@ -260,6 +260,8 @@ def test_cost_stages_store_the_same_outputs_and_raise_no_false_alarm(clean, stag
     if stage in ("append", "list"):                 # the list holds exactly the inputs that rb_list lists
         _, ref = run(b, "rb_list", x)
         assert c["uncertified"] == ref["uncertified"] > 0
+    else:                                           # no stage before "append" writes the list
+        assert c["uncertified"] == 0
 
 
 @pytest.mark.skipif(INTERP, reason="needs compiled code")

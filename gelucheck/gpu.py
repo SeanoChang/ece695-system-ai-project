@@ -234,8 +234,10 @@ def k_cost(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_pt
     3 poly    + the cubic
     4 cell    + the rounding-cell test and the compare with the stored output
     5 append  + the append of uncertified inputs to the list (stage 6, list, adds the second pass on the host)
-    Stages 1 to 3 pass their result through _sink, so the compiler keeps the work. From stage 4 on, the code
-    is that of k_std rb_list.
+    Each stage is the stage before plus one part: every term of the alarm `bad` stays in all later stages.
+    Stages 1 to 3 add a term through _sink, so the compiler keeps their work; each such term costs a multiply,
+    a compare and an OR per element. Stages 4 and up are therefore rb_list plus those three terms; the cost
+    experiment also times k_std rb_list, and the difference is their cost.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -248,15 +250,15 @@ def k_cost(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_pt
         bad = m & _sink(yf, zerof)
         if STAGE >= 2:
             inr, t, c0, c1, c2, c3, km = _lookup(x, coef_ptr, marg_ptr, LO, H, NT)
-            if STAGE == 2:
-                bad = bad | (m & inr & _sink(t + c0 + c1 + c2 + c3 + km, zerof))
-            if STAGE == 3:
-                bad = bad | (m & inr & _sink(_poly(t, c0, c1, c2, c3) + km, zerof))
-            if STAGE >= 4:
-                ok, vb = _cell(_poly(t, c0, c1, c2, c3), km, inr)
-                bad = m & ok & (vb != _bits16(y))
-                if STAGE >= 5:
-                    _append(m & (ok.to(tl.int32) == 0), offs, x, cnt_ptr, list_ptr, xval_ptr)
+            bad = bad | (m & inr & _sink(t + c0 + c1 + c2 + c3 + km, zerof))
+            if STAGE >= 3:
+                p = _poly(t, c0, c1, c2, c3)
+                bad = bad | (m & inr & _sink(p, zerof))
+                if STAGE >= 4:
+                    ok, vb = _cell(p, km, inr)
+                    bad = bad | (m & ok & (vb != _bits16(y)))
+                    if STAGE >= 5:
+                        _append(m & (ok.to(tl.int32) == 0), offs, x, cnt_ptr, list_ptr, xval_ptr)
         tl.atomic_add(bad_ptr, tl.sum(bad.to(tl.int32), axis=0))
 
 

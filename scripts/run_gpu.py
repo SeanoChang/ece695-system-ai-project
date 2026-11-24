@@ -325,8 +325,9 @@ def exp_cost(args):
               "cell": "+ rounding-cell test and compare",
               "append": "+ append uncertified inputs to the list",
               "list": "+ second pass over the list (= rb_list)"}
-    print("\nA step's cost is its median minus the median of the step before. Steps 'count' to 'poly' keep")
-    print("their work alive through a multiply by a run-time 0.0; 'cell' onwards is the code of rb_list.")
+    print("\nA step's cost is its median minus the median of the step before. Each step adds one part to the")
+    print("step before and keeps all of it. Steps 'count' to 'poly' keep their work alive through a multiply by")
+    print("a run-time 0.0, a compare and an OR per element; the ladder's last step is rb_list plus those three.")
     print(f"Each time: median of {args.repeat} repeats taken in turns (smallest-largest in brackets).")
     for tokens in (16,) if args.quick else (512, 4096):
         n = tokens * 4096
@@ -351,6 +352,8 @@ def exp_cost(args):
             prev = s
         print(f"    k_std for comparison: dup {t['dup'].us()}, rb_block {t['rb_block'].us()}, "
               f"rb_list {t['rb_list'].us()}")
+        print(f"    cost of the three keep-alive terms (last step - k_std rb_list): "
+              f"{(t['list'].med - t['rb_list'].med) * 1e3:+.1f} us")
         print(f"    estimate of the certify step as rb_block - dup (every block recomputes): "
               f"{(t['rb_block'].med - t['dup'].med) * 1e3:+.1f} us")
 
@@ -455,6 +458,8 @@ def main():
     ap.add_argument("--quick", action="store_true", help="tiny sizes and no timing: a test of the script itself")
     ap.add_argument("--repeat", type=int, default=5, help="timing repeats per kernel; the median is reported")
     args = ap.parse_args()
+    if args.repeat < 1:
+        ap.error("--repeat must be at least 1")
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU interpreter (no real timing)"
     print(f"torch {torch.__version__} | triton {triton.__version__} | {gpu_name}{' | QUICK' if args.quick else ''}")
     failed = []
