@@ -1,0 +1,220 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+torch 2.14.1+cu130 | triton 3.8.0 | NVIDIA RTX A6000
+
+== clean: Clean data: how often is the kernel not correctly rounded, and does any checker raise a false alarm?
+
+standard normal, n = 4,194,304: kernel outputs not correctly rounded 716 (1.71e-04)
+  check      | fused: false alarms | separate checker: false alarms | note
+  dup        |                   0 |                              0 |
+  range      |                   0 |                              0 |
+  rb_block   |                   0 |                              - | blocks recomputed 4095 of 4096 (100.0%)
+  rb_list    |                   0 |                              0 | certified 99.18%, second pass on 34444
+  rb_sum     |                   0 |                              0 | certified 99.18%, second pass on 34444
+  PyTorch F.gelu output as y (another binary of the same formula): differs from ours on 428
+    separate dup flags 428 (a duplicate matches only its own binary)
+    separate Route B flags 0 certified outputs (must be 0: the table accepts every kernel inside the bound)
+      and 428 in the second pass (that pass is a duplicate by our binary)
+
+uniform [-5, 5), n = 4,194,304: kernel outputs not correctly rounded 268037 (6.39e-02)
+  check      | fused: false alarms | separate checker: false alarms | note
+  dup        |                   0 |                              0 |
+  range      |                   0 |                              0 |
+  rb_block   |                   0 |                              - | blocks recomputed 4096 of 4096 (100.0%)
+  rb_list    |                   0 |                              0 | certified 80.20%, second pass on 830378
+  rb_sum     |                   0 |                              0 | certified 80.20%, second pass on 830378
+  PyTorch F.gelu output as y (another binary of the same formula): differs from ours on 195703
+    separate dup flags 195703 (a duplicate matches only its own binary)
+    separate Route B flags 0 certified outputs (must be 0: the table accepts every kernel inside the bound)
+      and 195703 in the second pass (that pass is a duplicate by our binary)
+
+== exhaustive: Every FP32 input in [-5, 5): the error bound and the false alarms, with no sampling.
+
+every FP32 input in [-5, 5): 2,168,455,169 bit patterns (+0 and -0 both count)
+  PyTorch F.gelu (FP32): max error / stored bound = 0.597 (must be <= 1)
+  our kernel: FP16 outputs outside the bound = 0 (must be 0)
+  Route B certifies 8.75% of these values (a count of values, not of real inputs)
+  fused dup      false alarms 0
+  fused range    false alarms 0
+  fused rb_block false alarms 0
+  fused rb_list  false alarms 0
+  fused rb_sum   false alarms 0
+  separate dup on PyTorch's outputs: flags 1228967 (a duplicate matches only its own binary)
+  separate Route B on PyTorch's outputs: flags 0 certified outputs (must be 0) and 1228967 in the second pass (a duplicate by our binary)
+
+== inject: One single-bit fault per block of 1024. Detection is counted over faults that changed the stored output.
+
+32,768 faults per site, standard-normal inputs, n = 1,048,576 per launch
+
+  site: FP32 erf result, first computation only
+    faults that changed the stored FP16 output: 19403 of 32768 (59.2%); 99.12% of them on certified outputs
+    dup      caught  19403 = 100.00%   flagged with no output change: 0
+    range    caught   5085 =  26.21%   flagged with no output change: 0
+    rb_block caught  19403 = 100.00%   flagged with no output change: 0
+    rb_list  caught  19403 = 100.00%   flagged with no output change: 0
+    rb_sum   caught  19403 = 100.00%   flagged with no output change: 0
+    fraction bits 0-9   : changed the output   1.9%; range check caught   0.0% of those
+    fraction bits 10-22 : changed the output  74.6%; range check caught   5.8% of those
+    exponent bits 23-30 : changed the output 100.0%; range check caught  49.7% of those
+    sign bit 31         : changed the output 100.0%; range check caught  37.2% of those
+
+  site: FP32 GELU output, first computation only
+    faults that changed the stored FP16 output: 20555 of 32768 (62.7%); 99.22% of them on certified outputs
+    dup      caught  20555 = 100.00%   flagged with no output change: 0
+    range    caught   4529 =  22.03%   flagged with no output change: 0
+    rb_block caught  20555 = 100.00%   flagged with no output change: 0
+    rb_list  caught  20555 = 100.00%   flagged with no output change: 0
+    rb_sum   caught  20555 = 100.00%   flagged with no output change: 0
+    fraction bits 0-9   : changed the output   0.0%; range check caught   0.0% of those
+    fraction bits 10-22 : changed the output  84.7%; range check caught   7.9% of those
+    exponent bits 23-30 : changed the output 100.0%; range check caught  31.2% of those
+    sign bit 31         : changed the output 100.0%; range check caught  99.8% of those
+
+  site: FP32 erf result, every computation (defective unit)
+    faults that changed the stored FP16 output: 19403 of 32768 (59.2%); 99.12% of them on certified outputs
+    dup      caught      0 =   0.00%   flagged with no output change: 0
+    range    caught   5085 =  26.21%   flagged with no output change: 0
+    rb_block caught  19233 =  99.12%   flagged with no output change: 0
+    rb_list  caught  19233 =  99.12%   flagged with no output change: 0
+    rb_sum   caught  19233 =  99.12%   flagged with no output change: 0
+
+  site: stored FP16 output (one bit flipped in memory after the kernel)
+    a fused check reads the register, so it cannot see this fault: 0% by construction
+    separate dup      caught  32768 of 32768 = 100.00%
+    separate range    caught   8855 of 32768 =  27.02%
+    separate rb_list  caught  32768 of 32768 = 100.00%
+    separate rb_sum   caught  32768 of 32768 = 100.00%
+
+  site: two faults in one block, FP32 GELU output, first computation only (checksum cancellation)
+    rb_sum: blocks with two wrong certified outputs 32231; checksum missed 0 (theory: about 0.49)
+
+== timing: Standalone kernels, FP32 in and FP16 out. Sizes are tokens times the 4096-wide MLP of Pythia-410M.
+
+Every checked variant includes the reset of its 8-byte counters (one tiny launch).
+rb_list and rb_sum include the second pass. A 'separate' row is the time of the check without the GELU
+kernel: the checker kernel, its counter reset and, for rb_list and rb_sum, the second pass.
+
+  16 tokens (65,536 elements); unprotected GELU 5.1 us = 77 GB/s
+    none                           5.1 us   x1.00 of unprotected
+    dup                            8.3 us   x1.63 of unprotected
+    range                          7.9 us   x1.55 of unprotected
+    rb_block                       9.9 us   x1.94 of unprotected
+    rb_list                       12.9 us   x2.53 of unprotected
+    rb_sum                        13.9 us   x2.72 of unprotected
+    separate dup                   8.0 us   x1.56 of unprotected   none + checker x2.56
+    separate range                 7.9 us   x1.55 of unprotected   none + checker x2.55
+    separate rb_list              13.1 us   x2.57 of unprotected   none + checker x3.57
+    separate rb_sum               14.0 us   x2.75 of unprotected   none + checker x3.75
+    torch F.gelu, FP32 out         5.3 us   x1.05 of unprotected
+
+  512 tokens (2,097,152 elements); unprotected GELU 23.0 us = 548 GB/s
+    none                          23.0 us   x1.00 of unprotected
+    dup                           27.8 us   x1.21 of unprotected
+    range                         30.1 us   x1.31 of unprotected
+    rb_block                      45.7 us   x1.99 of unprotected
+    rb_list                       49.9 us   x2.17 of unprotected
+    rb_sum                        50.8 us   x2.21 of unprotected
+    separate dup                  29.7 us   x1.29 of unprotected   none + checker x2.29
+    separate range                29.3 us   x1.28 of unprotected   none + checker x2.28
+    separate rb_list              52.9 us   x2.30 of unprotected   none + checker x3.30
+    separate rb_sum               61.9 us   x2.70 of unprotected   none + checker x3.70
+    torch F.gelu, FP32 out        28.1 us   x1.22 of unprotected
+
+  4096 tokens (16,777,216 elements); unprotected GELU 150.5 us = 669 GB/s
+    none                         150.5 us   x1.00 of unprotected
+    dup                          204.9 us   x1.36 of unprotected
+    range                        213.1 us   x1.42 of unprotected
+    rb_block                     278.7 us   x1.85 of unprotected
+    rb_list                      294.0 us   x1.95 of unprotected
+    rb_sum                       307.7 us   x2.04 of unprotected
+    separate dup                 154.2 us   x1.02 of unprotected   none + checker x2.02
+    separate range               153.8 us   x1.02 of unprotected   none + checker x2.02
+    separate rb_list             325.8 us   x2.16 of unprotected   none + checker x3.16
+    separate rb_sum              388.7 us   x2.58 of unprotected   none + checker x3.58
+    torch F.gelu, FP32 out       201.2 us   x1.34 of unprotected
+
+== matmul: C = GELU(A @ B), A (M x 1024) and B (1024 x 4096) in FP16: the Pythia-410M MLP up-projection.
+
+  M = 16 tokens
+    matmul        30.5 us   x0.959 of matmul + GELU
+    none          31.8 us   x1.000 of matmul + GELU
+    dup           33.2 us   x1.044 of matmul + GELU   false alarms 0, second pass / recomputed 0
+    rb_block      34.7 us   x1.091 of matmul + GELU   false alarms 0, second pass / recomputed 64
+    rb_list       37.0 us   x1.162 of matmul + GELU   false alarms 0, second pass / recomputed 518
+    rb_sum        37.7 us   x1.185 of matmul + GELU   false alarms 0, second pass / recomputed 518
+
+  M = 512 tokens
+    matmul        99.9 us   x0.767 of matmul + GELU
+    none         130.2 us   x1.000 of matmul + GELU
+    dup          117.6 us   x0.903 of matmul + GELU   false alarms 0, second pass / recomputed 0
+    rb_block     197.6 us   x1.517 of matmul + GELU   false alarms 0, second pass / recomputed 512
+    rb_list      211.5 us   x1.624 of matmul + GELU   false alarms 0, second pass / recomputed 17186
+    rb_sum       219.2 us   x1.683 of matmul + GELU   false alarms 0, second pass / recomputed 17186
+
+  M = 2048 tokens
+    matmul       349.6 us   x0.830 of matmul + GELU
+    none         421.4 us   x1.000 of matmul + GELU
+    dup          391.6 us   x0.929 of matmul + GELU   false alarms 0, second pass / recomputed 0
+    rb_block     690.2 us   x1.638 of matmul + GELU   false alarms 0, second pass / recomputed 2048
+    rb_list      735.9 us   x1.747 of matmul + GELU   false alarms 0, second pass / recomputed 68181
+    rb_sum       769.4 us   x1.826 of matmul + GELU   false alarms 0, second pass / recomputed 68181
+
+== models: GELU inputs captured from real FP16 models on real text (this repo's README).
+Loading weights: 100%|██████████| 292/292 [00:00<00:00, 4601.00it/s]
+
+  Pythia-410M, 1 x 512 tokens: 24 GELU calls, 50,331,648 inputs; outside [-5, 5): 0.048%; |x| mean 0.87, max 102.8
+    fused dup      false alarms 0
+    fused rb_list  false alarms 0, certified 98.55%
+    fused rb_sum   false alarms 0, certified 98.55%
+    the model's own FP16 GELU outputs differ from our kernel on 28650
+    separate dup on the model's own outputs flags 28650
+    separate Route B on the model's own outputs flags 0 certified outputs and 28650 in the second pass (a duplicate by our binary)
+Loading weights: 100%|██████████| 199/199 [00:00<00:00, 2402.43it/s]
+[transformers] BertModel LOAD REPORT from: google-bert/bert-base-uncased
+Key                                        | Status     |  |
+-------------------------------------------+------------+--+-
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  |
+cls.predictions.transform.dense.weight     | UNEXPECTED |  |
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  |
+cls.predictions.bias                       | UNEXPECTED |  |
+cls.seq_relationship.weight                | UNEXPECTED |  |
+cls.seq_relationship.bias                  | UNEXPECTED |  |
+cls.predictions.transform.dense.bias       | UNEXPECTED |  |
+
+Notes:
+- UNEXPECTED:   can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+
+  BERT-base, 32 x 128 tokens: 12 GELU calls, 150,994,944 inputs; outside [-5, 5): 0.654%; |x| mean 1.91, max 139.5
+    fused dup      false alarms 0
+    fused rb_list  false alarms 0, certified 83.88%
+    fused rb_sum   false alarms 0, certified 83.88%
+    the model's own FP16 GELU outputs differ from our kernel on 3025727
+    separate dup on the model's own outputs flags 3025727
+    separate Route B on the model's own outputs flags 0 certified outputs and 3025727 in the second pass (a duplicate by our binary)
+
+== share: Share of GPU kernel time spent in GELU kernels, eager FP16 PyTorch.
+Loading weights: 100%|██████████| 292/292 [00:00<00:00, 4191.98it/s]
+USDT:2026-11-24 13:20:41 3782097:3782097 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-11-24 13:20:41 3782097:3782097 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-11-24 13:20:43 3782097:3782097 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-11-24 13:20:44 3782097:3782097 SyncActivityProfilerHandler.cpp:46] profiler_stop
+
+  Pythia-410M prefill, 1 x 512 tokens:                GELU 3.09% of GPU time
+  Pythia-410M, 32-token prompt + 64 generated tokens: GELU 1.57% of GPU time
+Loading weights: 100%|██████████| 199/199 [00:00<00:00, 2444.60it/s]
+[transformers] BertModel LOAD REPORT from: google-bert/bert-base-uncased
+Key                                        | Status     |  |
+-------------------------------------------+------------+--+-
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  |
+cls.predictions.transform.dense.weight     | UNEXPECTED |  |
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  |
+cls.predictions.bias                       | UNEXPECTED |  |
+cls.seq_relationship.weight                | UNEXPECTED |  |
+cls.seq_relationship.bias                  | UNEXPECTED |  |
+cls.predictions.transform.dense.bias       | UNEXPECTED |  |
+
+Notes:
+- UNEXPECTED:   can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+USDT:2026-11-24 13:20:49 3782097:3782097 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-11-24 13:20:49 3782097:3782097 SyncActivityProfilerHandler.cpp:46] profiler_stop
+  BERT-base, 32 x 128 tokens:                         GELU 8.81% of GPU time

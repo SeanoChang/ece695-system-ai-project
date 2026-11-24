@@ -157,6 +157,46 @@ Two results shape the design. First, a checker that predicts the correctly round
 on a correct kernel. Second, two compiled versions of the same formula give different bits, so a duplicate must
 be the same compiled code as the kernel that it checks.
 
+### Full run on the GPU (2026-11-24)
+
+`scripts/run_gpu.py` on one RTX A6000 (torch 2.14.1+cu130, Triton 3.8.0). All 34 tests pass on the GPU
+([`results/pytest_gpu.txt`](results/pytest_gpu.txt)). Full output: [`results/gpu.txt`](results/gpu.txt).
+
+**Correctness holds on the compiled kernels.**
+
+- Clean runs: 0 false alarms for every check, fused and separate, on 4.2 million normal and 4.2 million uniform
+  inputs. Route B certifies 99.18% (normal) and 80.20% (uniform).
+- Every FP32 input in [−5, 5) (2,168,455,169 bit patterns): PyTorch's `F.gelu` reaches 0.597 of the stored error
+  bound at most, our kernel has 0 outputs outside the bound, and every check has 0 false alarms.
+- Another binary: PyTorch's `F.gelu` outputs differ from our kernel's on 428 of 4.2 million normal inputs. A
+  separate Route B checker flags 0 of them on certified outputs. A separate duplicate flags all 428.
+- Real activations, on this README as text: Route B certifies 98.55% of Pythia-410M's GELU inputs and 83.88% of
+  BERT-base's, with 0 false alarms.
+
+**Detection** (one single-bit fault per block of 1024; the rate counts faults that changed the stored output):
+
+| Fault | Duplication | Range check | Route B (`rb_list`, `rb_sum`) |
+|---|---|---|---|
+| `erf` result, first computation only | 100% | 26.2% | 100% |
+| GELU output, first computation only | 100% | 22.0% | 100% |
+| `erf` result, every computation (defective unit) | 0% | 26.2% | 99.12% (the certified share) |
+| Stored FP16 output, separate checker | 100% | 27.0% | 100% |
+
+The checksum `rb_sum` missed 0 of 32,231 blocks with two wrong certified outputs (theory: about 0.49).
+
+**Cost: Route B is slower than duplication.** Times relative to the unprotected kernel, fused checks:
+
+| Setting | Unprotected | Duplication | Range check | `rb_list` | `rb_sum` |
+|---|---|---|---|---|---|
+| Standalone GELU, 4096 tokens × 4096 | 150.5 µs | ×1.36 | ×1.42 | ×1.95 | ×2.04 |
+| Standalone GELU, 512 tokens × 4096 | 23.0 µs | ×1.21 | ×1.31 | ×2.17 | ×2.21 |
+| GELU(A·B) epilogue, M = 2048 | 421.4 µs | ×0.93 | – | ×1.75 | ×1.83 |
+| GELU(A·B) epilogue, M = 512 | 130.2 µs | ×0.90 | – | ×1.62 | ×1.68 |
+
+The success criterion (same detection as duplication at lower latency) is not met by these kernels. GELU takes
+3.09% of GPU time in Pythia-410M prefill (512 tokens), 1.57% in generation, and 8.81% in BERT-base (32 × 128).
+Where Route B's time goes is not measured yet.
+
 ### Route A is the weak link
 
 With 16-bit outputs, correct values are rounded. Over a block of 256, that rounding moves the two sides of the
@@ -181,13 +221,13 @@ Full outputs are in [`results/`](results/).
 
 ### What these results do not show
 
-- **GPU cost.** No timing is measured yet. The success criterion, lower latency than optimized duplication,
-  needs the run of `scripts/run_gpu.py` on a GPU.
-- **Real activations.** The inputs above are synthetic (normal and uniform). `scripts/run_gpu.py` captures GELU
-  inputs from Pythia-410M and BERT; it is not run yet.
-- **Fault model.** The CPU runs test only output bit flips. The GPU run injects faults inside the arithmetic.
+- **Where the cost goes.** The GPU run measures total kernel time only. It does not split Route B's time into
+  the table lookup, the cell test, the atomic list append and the second pass.
+- **Model-level latency.** GELU's share of GPU time is measured; the latency of a whole model with a check is not.
+- **Real activations.** The captured inputs come from one text (this README) on two models.
+- **One GPU.** All GPU numbers come from one RTX A6000 with one PyTorch and Triton version.
 - **A proof for `erf`.** NVIDIA's 2 ulp limit for `erff` comes from tests, not from a proof. The kernel error
-  bound depends on it. `scripts/run_gpu.py` tests every FP32 input in [−5, 5) on the GPU in use.
+  bound depends on it. The exhaustive run checks it for every FP32 input in [−5, 5) on this GPU and library only.
 - **Checker precision.** Route A's checker runs in float64 here. An FP32 checker would do worse.
 
 ## Evaluation plan and status
@@ -209,14 +249,15 @@ latency against duplication.
 | Planned item | Status |
 |---|---|
 | Bound, certification and checksum on synthetic inputs (CPU) | Done: `scripts/run_route_b.py` |
-| Standalone GPU kernels: none, duplication, range check, Route B | Written: `gelucheck/gpu.py`. Tested in Triton's CPU interpreter. Not run on a GPU yet |
-| GELU fused into the matrix-multiply epilogue | Written (`k_mm`), tested in the interpreter, not run on a GPU yet |
-| Clean false alarms against the production (not correctly rounded) GELU kernel | Measured for the prediction alone (see above). Kernels: not run on a GPU yet |
-| Block checksum `D mod 65537` on the GPU | Written (`rb_sum`), tested against `route_b.checksum` in the interpreter |
-| Faults injected inside the GELU arithmetic | Written: `erf` result and output, in the first computation only or in every computation |
-| Detection rate per bit position, multiple bit flips | Written, by bit group; two faults in one block for the checksum |
-| GELU inputs captured from Pythia-410M and BERT | Written (`run_gpu.py`, experiment `models`), not run yet |
-| Model-level latency | Missing |
+| Standalone GPU kernels: none, duplication, range check, Route B | Done on an RTX A6000: tests pass, timed |
+| GELU fused into the matrix-multiply epilogue | Done on the GPU: timed, 0 false alarms |
+| Clean false alarms against the production (not correctly rounded) GELU kernel | Done: 0 on sampled inputs and on every FP32 input in [−5, 5) |
+| Block checksum `D mod 65537` on the GPU | Done: matches `route_b.checksum`; 0 of 32,231 double faults missed |
+| Faults injected inside the GELU arithmetic | Done: `erf` result and output, in the first computation only or in every computation |
+| Detection rate per bit position, multiple bit flips | Done, by bit group; two faults in one block for the checksum |
+| GELU inputs captured from Pythia-410M and BERT | Done: certified 98.55% and 83.88%, 0 false alarms |
+| Where Route B's time goes | Missing |
+| Model-level latency | Missing; GELU's share of GPU time is measured (1.6% to 8.8%) |
 
 **Resources.** One GPU (an RTX A6000 on the ECN `dlm` server) and a model under 1 GB, a few GPU-hours in total.
 PyTorch, Triton and Hugging Face Transformers.

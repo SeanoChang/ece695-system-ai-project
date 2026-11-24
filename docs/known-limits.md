@@ -32,6 +32,12 @@ unless the entry says so.
   run-time zero. A fault in the load of `x` reaches both copies.
 - **Text for the model inputs.** The `models` experiment feeds this repository's README to Pythia-410M and BERT.
   It is one text of one kind.
+- **The GPU tests take 18.5 minutes** on dlm (`results/pytest_gpu.txt`). The slowest tests spend their time in
+  host-side NumPy on 2 million elements (`np.setdiff1d` and the bit copies in `tests/test_gpu.py:139-140`), not
+  on the GPU. `results/pytest_gpu.txt` is copied from the terminal, with the repeated pytest frames of two
+  stacks cut.
+- **The range check is slower than duplication** in the standalone kernel (×1.42 against ×1.36 at 4096 tokens).
+  We did not look into why.
 - **The range check flags correct outputs for extreme inputs:** NaN, −∞, and x ≥ 65520, where the FP16 output
   is +∞. No experiment gives such inputs to the range check, and FP16 activations cannot reach 65520.
 

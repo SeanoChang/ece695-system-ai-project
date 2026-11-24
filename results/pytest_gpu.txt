@@ -1,0 +1,71 @@
+Test run on the GPU: NVIDIA RTX A6000 on ECN dlm, torch 2.14.1+cu130, triton 3.8.0, 2026-11-24.
+Command: pytest -v -o faulthandler_timeout=180 --durations=10 tests/
+The two "Timeout (0:03:00)!" stacks are faulthandler's report of a test that ran longer than 3 minutes; it does
+not stop the test. Both tests passed. The repeated pytest/pluggy frames of each stack are cut here.
+
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.2.0, pluggy-1.7.0 -- /home/min/a/chang755/ece695sai/ece695-system-ai-project/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/min/a/chang755/ece695sai/ece695-system-ai-project
+plugins: anyio-4.16.0
+collecting ... collected 34 items
+
+tests/test_gelucheck.py::test_tanh_forms_agree PASSED                    [  2%]
+tests/test_gelucheck.py::test_batch_identity_exact_in_float64 PASSED     [  5%]
+tests/test_gelucheck.py::test_tail_bound PASSED                          [  8%]
+tests/test_gelucheck.py::test_bf16_rounding_matches_brute_force PASSED   [ 11%]
+tests/test_gelucheck.py::test_route_b_bound_holds_and_certified_outputs_are_exact PASSED [ 14%]
+tests/test_gelucheck.py::test_kernel_target_matches_every_kernel_inside_the_bound PASSED [ 17%]
+tests/test_gelucheck.py::test_evaluate_keeps_the_input_shape PASSED      [ 20%]
+tests/test_gelucheck.py::test_certify_needs_an_explicit_target PASSED    [ 23%]
+tests/test_gelucheck.py::test_build_rejects_knots_that_are_not_exact PASSED [ 26%]
+tests/test_gelucheck.py::test_checksum_catches_any_single_error PASSED   [ 29%]
+tests/test_gpu.py::test_kernel_output_is_inside_the_error_bound PASSED   [ 32%]
+tests/test_gpu.py::test_interval_index_is_exact_next_to_the_knots PASSED [ 35%]
+tests/test_gpu.py::test_certify_matches_numpy PASSED                     [ 38%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[dup-True] PASSED    [ 41%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[dup-False] PASSED   [ 44%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[range-True] PASSED  [ 47%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[range-False] PASSED [ 50%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_block-True] PASSED [ 52%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_block-False] PASSED [ 55%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_list-True] PASSED [ 58%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_list-False] PASSED [ 61%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_sum-True] PASSED [ 64%]
+tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_sum-False] PASSED [ 67%]
+tests/test_gpu.py::test_every_effective_transient_fault_is_caught[erf] Timeout (0:03:00)!
+Thread 0x00007fe3e1d9a1c0 (most recent call first):
+  File "/home/min/a/chang755/ece695sai/ece695-system-ai-project/.venv/lib/python3.10/site-packages/numpy/lib/_arraysetops_impl.py", line 345 in _unique1d
+  File "/home/min/a/chang755/ece695sai/ece695-system-ai-project/.venv/lib/python3.10/site-packages/numpy/lib/_arraysetops_impl.py", line 286 in unique
+  File "/home/min/a/chang755/ece695sai/ece695-system-ai-project/.venv/lib/python3.10/site-packages/numpy/lib/_arraysetops_impl.py", line 1213 in setdiff1d
+  File "/home/min/a/chang755/ece695sai/ece695-system-ai-project/tests/test_gpu.py", line 140 in test_every_effective_transient_fault_is_caught
+  [pytest and pluggy frames cut]
+PASSED [ 70%]
+tests/test_gpu.py::test_every_effective_transient_fault_is_caught[out] Timeout (0:03:00)!
+Thread 0x00007fe3e1d9a1c0 (most recent call first):
+  File "/home/min/a/chang755/ece695sai/ece695-system-ai-project/tests/test_gpu.py", line 28 in bits
+  File "/home/min/a/chang755/ece695sai/ece695-system-ai-project/tests/test_gpu.py", line 139 in test_every_effective_transient_fault_is_caught
+  [pytest and pluggy frames cut]
+PASSED [ 73%]
+tests/test_gpu.py::test_checksum_matches_numpy PASSED                    [ 76%]
+tests/test_gpu.py::test_fault_in_both_copies_escapes_duplication_but_not_route_b PASSED [ 79%]
+tests/test_gpu.py::test_separate_checker_sees_a_fault_in_the_stored_output[dup] PASSED [ 82%]
+tests/test_gpu.py::test_separate_checker_sees_a_fault_in_the_stored_output[rb_list] PASSED [ 85%]
+tests/test_gpu.py::test_separate_checker_sees_a_fault_in_the_stored_output[rb_sum] PASSED [ 88%]
+tests/test_gpu.py::test_separate_checker_sees_a_fault_in_the_stored_output[rb_block] PASSED [ 91%]
+tests/test_gpu.py::test_special_inputs_do_not_break_the_checkers PASSED  [ 94%]
+tests/test_gpu.py::test_matmul_epilogue_variants_agree_and_raise_no_false_alarm PASSED [ 97%]
+tests/test_gpu.py::test_duplicate_is_not_merged_by_the_compiler PASSED   [100%]
+
+============================= slowest 10 durations =============================
+303.27s call     tests/test_gpu.py::test_every_effective_transient_fault_is_caught[out]
+245.88s call     tests/test_gpu.py::test_every_effective_transient_fault_is_caught[erf]
+138.89s call     tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_list-True]
+114.90s call     tests/test_gpu.py::test_certify_matches_numpy
+84.50s call     tests/test_gpu.py::test_checksum_matches_numpy
+72.25s call     tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_sum-True]
+51.54s call     tests/test_gpu.py::test_clean_run_has_no_false_alarm[dup-True]
+28.02s call     tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_list-False]
+14.27s call     tests/test_gpu.py::test_clean_run_has_no_false_alarm[rb_block-False]
+13.24s call     tests/test_gpu.py::test_kernel_output_is_inside_the_error_bound
+======================= 34 passed in 1108.12s (0:18:28) ========================
