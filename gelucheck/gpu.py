@@ -16,17 +16,25 @@ Variants (the check that runs with, or after, that kernel):
 fused=True checks the value in the register of the kernel that computes GELU. fused=False is a separate
 checker kernel that reads y back from memory, so it also sees a fault in the store or in memory.
 
+Fault model (injection builds only): faults(bad_sm=-1) is a fault in the first computation, and also in
+the recomputation if persist. faults(bad_sm=k) is a defective SM: every computation that runs on SM k gets
+the fault, and no other computation does. Each block records the SM it ran on (sm, and sm2 for a separate
+checker), read from the hardware (%smid); the CPU interpreter has no SMs and uses the program id mod 8.
+A separate checker can check block (pid + shift) mod nb, so that its copy runs on another SM.
+
 Counters: bad counts wrong outputs (rb_sum: blocks with D != 0, plus wrong uncertified outputs);
 uncertified counts list entries (rb_block: blocks that were recomputed).
 
 Runs on a CUDA GPU, or on the CPU with TRITON_INTERPRET=1 (slow; for tests of the logic).
 """
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import smid as _cuda_smid
 
 from . import route_b
 
@@ -36,6 +44,8 @@ COST_STAGES = ("none", "count", "predict", "cell", "append", "list")   # see k_c
 BLOCK = 1024           # elements per program in the standalone kernels
 TILE = 64              # the fused matmul uses TILE x TILE (or 16 x TILE) tiles
 FB_GRID = 40           # programs of the second pass; fixed, so the host never reads the list length
+SIM_SMS = 8            # the CPU interpreter has no SMs: _sm() is the program id mod SIM_SMS there
+_SIM = tl.constexpr(os.environ.get("TRITON_INTERPRET") == "1")
 
 
 def device():
@@ -54,6 +64,27 @@ def _gelu_f(x, fe, fo):
     e = (e.to(tl.int32, bitcast=True) ^ fe).to(tl.float32, bitcast=True)
     y = 0.5 * x * (1.0 + e)
     return (y.to(tl.int32, bitcast=True) ^ fo).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _sm():
+    """The SM that runs this program: %smid on the GPU; the program id mod SIM_SMS in the interpreter."""
+    if _SIM:
+        return tl.program_id(0) % SIM_SMS
+    else:
+        return _cuda_smid()
+
+
+@triton.jit
+def _active(bad_sm, persist):
+    """Fault factors (0 or 1) for the first computation and for a recomputation in this program.
+
+    bad_sm < 0: the first computation always, the recomputation if persist (the older model).
+    bad_sm >= 0: both exactly when this program runs on SM bad_sm (a defective SM).
+    """
+    old = (bad_sm < 0).to(tl.int32)
+    on = (_sm() == bad_sm).to(tl.int32)
+    return old + (1 - old) * on, old * persist + (1 - old) * on
 
 
 @triton.jit
@@ -134,28 +165,40 @@ def _append(unc, idx, val, cnt_ptr, list_ptr, xval_ptr):
     tl.store(xval_ptr + pos, val, mask=unc)
 
 
-@triton.jit(do_not_specialize=["zero", "persist", "n"])
+@triton.jit(do_not_specialize=["zero", "persist", "bad_sm", "shift", "n"])
 def k_std(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr, r_ptr,
-          fe_ptr, fo_ptr, flag_ptr, d_ptr, ok_ptr, vb_ptr, zero, persist, n,
+          fe_ptr, fo_ptr, flag_ptr, d_ptr, ok_ptr, vb_ptr, sm_ptr, zero, persist, bad_sm, shift, n,
           MODE: tl.constexpr, FUSED: tl.constexpr, INJ: tl.constexpr,
           LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr, BLOCK: tl.constexpr):
     """Standalone GELU (FP32 in, FP16 out) with check MODE (index into VARIANTS).
 
     INJ builds add what the experiments need and the timed builds must not pay for: fault masks, one flag
-    per element, the checksum per block, and the certified mask and prediction per element.
+    per element, the checksum per block, the certified mask and prediction per element, and the SM of
+    each block. A separate checker (not FUSED) checks block (pid + shift) mod the grid size.
     """
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    blk = pid
+    if not FUSED:
+        blk = (pid + shift) % tl.num_programs(0)
+    offs = blk * BLOCK + tl.arange(0, BLOCK)
     m = offs < n
     x = tl.load(x_ptr + offs, mask=m, other=1.0)
-    fe = tl.zeros((BLOCK,), dtype=tl.int32)
-    fo = tl.zeros((BLOCK,), dtype=tl.int32)
+    fe1 = tl.zeros((BLOCK,), dtype=tl.int32)        # fault masks of the first computation and of the recomputation
+    fo1 = tl.zeros((BLOCK,), dtype=tl.int32)
+    fe2 = fe1
+    fo2 = fo1
     if INJ:
         fe = tl.load(fe_ptr + offs, mask=m, other=0)
         fo = tl.load(fo_ptr + offs, mask=m, other=0)
+        first, again = _active(bad_sm, persist)
+        fe1 = fe * first
+        fo1 = fo * first
+        fe2 = fe * again
+        fo2 = fo * again
+        tl.store(sm_ptr + blk, _sm())
     if FUSED:
         if INJ:
-            y = _gelu_f(x, fe, fo).to(tl.float16)
+            y = _gelu_f(x, fe1, fo1).to(tl.float16)
         else:
             y = _gelu(x).to(tl.float16)
         tl.store(y_ptr + offs, y, mask=m)
@@ -167,7 +210,7 @@ def k_std(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr
     if MODE == 1:
         x2 = _opaque(x, zero)
         if INJ:
-            y2 = _gelu_f(x2, fe * persist, fo * persist)
+            y2 = _gelu_f(x2, fe2, fo2)
         else:
             y2 = _gelu(x2)
         bad = m & (_bits16(y2.to(tl.float16)) != yb)
@@ -188,7 +231,7 @@ def k_std(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr
             if tl.sum(unc.to(tl.int32), axis=0) > 0:
                 x2 = _opaque(x, zero)
                 if INJ:
-                    y2 = _gelu_f(x2, fe * persist, fo * persist)
+                    y2 = _gelu_f(x2, fe2, fo2)
                 else:
                     y2 = _gelu(x2)
                 bad = bad | (unc & (_bits16(y2.to(tl.float16)) != yb))
@@ -204,7 +247,7 @@ def k_std(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr
             d = tl.sum(r.to(tl.int64) * diff.to(tl.int64), axis=0) % 65537
             tl.atomic_add(bad_ptr, (d != 0).to(tl.int32))
             if INJ:
-                tl.store(d_ptr + pid, ((d + 65537) % 65537).to(tl.int32))
+                tl.store(d_ptr + blk, ((d + 65537) % 65537).to(tl.int32))
             _append(unc, offs, x, cnt_ptr, list_ptr, xval_ptr)
     if MODE >= 1:
         if MODE != 5:
@@ -261,8 +304,8 @@ def k_index(x_ptr, j_ptr, t_ptr, n, LO: tl.constexpr, H: tl.constexpr, NT: tl.co
     tl.store(t_ptr + offs, t, mask=m)
 
 
-@triton.jit(do_not_specialize=["persist"])
-def k_fallback(xval_ptr, list_ptr, cnt_ptr, y_ptr, bad_ptr, fe_ptr, fo_ptr, flag_ptr, persist,
+@triton.jit(do_not_specialize=["persist", "bad_sm"])
+def k_fallback(xval_ptr, list_ptr, cnt_ptr, y_ptr, bad_ptr, fe_ptr, fo_ptr, flag_ptr, persist, bad_sm,
                INJ: tl.constexpr, BLOCK: tl.constexpr):
     """Second pass: recompute only the listed (uncertified) inputs and compare with the stored outputs.
 
@@ -277,8 +320,9 @@ def k_fallback(xval_ptr, list_ptr, cnt_ptr, y_ptr, bad_ptr, fe_ptr, fo_ptr, flag
         x = tl.load(xval_ptr + k, mask=m, other=1.0)
         y = tl.load(y_ptr + i, mask=m, other=0.0)
         if INJ:
-            fe = tl.load(fe_ptr + i, mask=m, other=0) * persist
-            fo = tl.load(fo_ptr + i, mask=m, other=0) * persist
+            _, again = _active(bad_sm, persist)
+            fe = tl.load(fe_ptr + i, mask=m, other=0) * again
+            fo = tl.load(fo_ptr + i, mask=m, other=0) * again
             y2 = _gelu_f(x, fe, fo)
         else:
             y2 = _gelu(x)
@@ -351,6 +395,9 @@ class Faults:
     flag     (n,) int32  out: > 0 where an element check fired
     d        (n_blocks,) int32  out: rb_sum checksum of each block
     ok, vb   (n,) int32  out: Route B certified mask and predicted FP16 bits
+    sm, sm2  (n_blocks,) int32  out: the SM that computed each block (fused run or the faulty kernel), and
+                         the SM that checked it (separate checker); -1 until a run writes it
+    bad_sm   int         -1: the model above. k >= 0: a defective SM k (persist is then ignored)
     """
     fe: torch.Tensor
     fo: torch.Tensor
@@ -358,7 +405,10 @@ class Faults:
     d: torch.Tensor
     ok: torch.Tensor
     vb: torch.Tensor
+    sm: torch.Tensor
+    sm2: torch.Tensor
     persist: bool = False
+    bad_sm: int = -1
 
 
 class Bench:
@@ -380,28 +430,35 @@ class Bench:
         self.xval = torch.zeros(n, dtype=torch.float32, device=self.dev)
         self.i0 = torch.zeros(1, dtype=torch.int32, device=self.dev)        # stands in for unused pointers
 
-    def faults(self, n, persist=False):
+    def faults(self, n, persist=False, bad_sm=-1):
         z = lambda k: torch.zeros(k, dtype=torch.int32, device=self.dev)
-        return Faults(z(n), z(n), z(n), z(triton.cdiv(n, self.block)), z(n), z(n), persist)
+        nb = triton.cdiv(n, self.block)
+        unset = lambda: torch.full((nb,), -1, dtype=torch.int32, device=self.dev)
+        return Faults(z(n), z(n), z(n), z(nb), z(n), z(n), unset(), unset(), persist, bad_sm)
 
-    def run(self, variant, x, y, fused=True, faults=None):
+    def run(self, variant, x, y, fused=True, faults=None, shift=0):
         """Launch the kernels of one variant; read counts() afterwards.
 
-        Returns the compiled k_std kernel (its n_regs and n_spills on a GPU; None in the interpreter)."""
+        shift (separate checkers only): check block (pid + shift) mod nb, so the copy most likely runs on
+        another SM than the kernel that computed y. Where it ran is recorded in faults.sm2.
+        Returns the compiled k_std kernel (its n_regs and n_spills on a GPU; None in the interpreter).
+        """
         n, mode, f = x.numel(), VARIANTS.index(variant), faults
         assert n <= self.n and x.dtype == torch.float32 and y.dtype == torch.float16 and x.dim() == y.dim() == 1
         assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
         assert fused or mode, "a separate checker needs a check"
+        assert shift == 0 or not fused, "only a separate checker can check another block"
         if mode:
             self.ctr.zero_()
         fe, fo, flag, d, ok, vb = (f.fe, f.fo, f.flag, f.d, f.ok, f.vb) if f else (self.i0,) * 6
-        persist = int(f.persist) if f else 0
+        sm = (f.sm if fused else f.sm2) if f else self.i0
+        persist, bad_sm = (int(f.persist), int(f.bad_sm)) if f else (0, -1)
         k = k_std[(triton.cdiv(n, self.block),)](
             x, y, self.bad, self.cnt, self.list, self.xval, self.coef, self.marg, self.r,
-            fe, fo, flag, d, ok, vb, 0, persist, n,
+            fe, fo, flag, d, ok, vb, sm, 0, persist, bad_sm, shift, n,
             MODE=mode, FUSED=fused, INJ=f is not None, BLOCK=self.block, **self.const)
         if mode >= 4:
-            k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, fe, fo, flag, persist,
+            k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, fe, fo, flag, persist, bad_sm,
                                    INJ=f is not None, BLOCK=self.block)
         return k
 
@@ -419,7 +476,7 @@ class Bench:
             MODE=mode, BM=BM, BN=TILE, BK=32, num_warps=4, num_stages=2, **self.const)
         if mode >= 4:
             k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, c.reshape(-1), self.bad, self.i0, self.i0,
-                                   self.i0, 0, INJ=False, BLOCK=self.block)
+                                   self.i0, 0, -1, INJ=False, BLOCK=self.block)
 
     def cost(self, stage, x, y):
         """Launch the cost stage `stage` (a name in COST_STAGES) of fused GELU on x, storing y.
@@ -434,7 +491,7 @@ class Bench:
             x, y, self.bad, self.cnt, self.list, self.xval, self.coef, self.marg, 0, n,
             STAGE=min(s, 4), BLOCK=self.block, **self.const)
         if s == 5:
-            k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, self.i0, self.i0, self.i0, 0,
+            k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, self.i0, self.i0, self.i0, 0, -1,
                                    INJ=False, BLOCK=self.block)
         return k
 

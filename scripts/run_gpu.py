@@ -5,7 +5,7 @@ Usage (one idle GPU; about 10 minutes, mostly the model downloads on the first r
     ... scripts/run_gpu.py --only clean,inject        run some experiments
     TRITON_INTERPRET=1 PYTHONPATH=. python scripts/run_gpu.py --quick --only clean,inject   (CPU, tiny, logic only)
 
-Experiments: clean, exhaustive, inject, timing, matmul, cost, models, share. One that fails is reported; the rest run.
+Experiments: clean, exhaustive, inject, sm_fault, timing, matmul, cost, models, share. One that fails is reported; the rest run.
 """
 import argparse
 import pathlib
@@ -234,6 +234,70 @@ def exp_inject(args):
           f"(theory: about {blocks / 65537:.2f})")
 
 
+def exp_sm_fault(args):
+    """A defective SM: every computation on one SM gets the fault, checks that run there included."""
+    n = 1 << (13 if args.quick else 20)
+    b = gpu.Bench(n)
+    nb = n // b.block
+    x, y0, y = draw("standard normal", n, 4), half(n), half(n)
+    b.run("none", x, y0)
+    p1, p2 = b.faults(n), b.faults(n)
+    b.run("none", x, y, faults=p1)
+    b.run("none", x, y, faults=p2)
+    s1, s2 = p1.sm.cpu().numpy(), p2.sm.cpu().numpy()
+    sms = np.unique(s1)
+    per_sm = np.bincount(s1)[sms]
+    print(f"\n  n = {n:,} ({nb} blocks of {b.block}); the kernel ran on {len(sms)} SMs, "
+          f"{per_sm.min()}-{per_sm.max()} blocks each")
+    print(f"  a block ran on the same SM in two launches: {100 * np.mean(s1 == s2):.1f}% of blocks")
+    chosen = np.random.default_rng(11).choice(sms, size=min(8, len(sms)), replace=False)
+    rounds = 1 if args.quick else 4
+    print(f"  defective SMs tried: {', '.join(str(int(k)) for k in chosen)}; {rounds} rounds each; one random")
+    print("  bit of the FP32 erf result flipped in one element per block, active only where that SM computes.")
+    print("  A wrong block: its fault changed the stored output. Caught: any alarm in the block. An alarm on a")
+    print("  correct block comes from a check that itself ran on the defective SM.")
+    base = torch.arange(nb, device=DEV) * b.block
+    fused = ("dup", "rb_list", "rb_sum")
+    separate = (("dup", 0), ("dup", nb // 2), ("rb_list", 0))
+    names = [f"fused {v}" for v in fused] + [f"separate {v}" + (", shifted" if sh else "") for v, sh in separate]
+    tot = {k: np.zeros(4, np.int64) for k in names}  # wrong blocks, caught, alarms on correct blocks, same SM
+
+    def tally(name, f, y_out, check_sm):
+        eff = b16(y_out)[pos] != b16(y0)[pos]
+        alarm = (f.flag.reshape(nb, b.block) > 0).any(1) | (f.d != 0)
+        same = (check_sm == bad) & eff if check_sm is not None else torch.zeros_like(eff)
+        tot[name] += [int(eff.sum()), int((eff & alarm).sum()), int((~eff & alarm).sum()), int(same.sum())]
+
+    for bad in (int(k) for k in chosen):
+        for r in range(rounds):
+            g = torch.Generator().manual_seed(1000 + r)
+            pos = base + torch.randint(0, b.block, (nb,), generator=g).to(DEV)
+            bit = torch.randint(0, 32, (nb,), generator=g)
+            mask = torch.tensor((1 << bit.numpy().astype(np.int64)).astype(np.uint32).view(np.int32), device=DEV)
+
+            def faults():
+                f = b.faults(n, bad_sm=bad)
+                f.fe[pos] = mask
+                return f
+
+            for v, name in zip(fused, names[:3]):
+                f = faults()
+                b.run(v, x, y, faults=f)
+                tally(name, f, y, None)
+            for (v, sh), name in zip(separate, names[3:]):
+                f = faults()
+                b.run("none", x, y, faults=f)       # the faulty kernel
+                f2 = faults()
+                b.run(v, x, y, fused=False, faults=f2, shift=sh)
+                tally(name, f2, y, f2.sm2 if v == "dup" else None)
+    print(f"\n  {'check':24s} {'wrong blocks':>12s} {'caught':>16s} {'alarms on correct blocks':>25s} "
+          f"{'check ran on the bad SM too':>28s}")
+    for name in names:
+        w, c, a, sm = tot[name]
+        same = f"{sm} ({100 * sm / max(w, 1):.1f}%)" if name.startswith("separate dup") else "-"
+        print(f"  {name:24s} {w:12d} {c:7d} = {100 * c / max(w, 1):6.2f}% {a:25d} {same:>28s}")
+
+
 class Time(NamedTuple):
     """Kernel time in ms: the median over the repeats, and the smallest and largest repeat."""
     med: float
@@ -274,6 +338,7 @@ def exp_timing(args):
             fns[v] = lambda v=v: b.run(v, x, y)
         for v in SEPARATE:
             fns["separate " + v] = lambda v=v: b.run(v, x, y, fused=False)
+        fns["separate dup, shifted"] = lambda: b.run("dup", x, y, fused=False, shift=triton.cdiv(n, b.block) // 2)
         fns["torch F.gelu, FP32 out"] = lambda: F.gelu(x)
         for fn in fns.values():                      # compiles every kernel; y ends as the clean output
             fn()
@@ -449,7 +514,8 @@ def exp_share(args):
         print(f"  BERT-base, 32 x 128 tokens:                         GELU {share(lambda: bert(bids)):.2f}% of GPU time")
 
 
-EXPERIMENTS = {"clean": exp_clean, "exhaustive": exp_exhaustive, "inject": exp_inject, "timing": exp_timing,
+EXPERIMENTS = {"clean": exp_clean, "exhaustive": exp_exhaustive, "inject": exp_inject, "sm_fault": exp_sm_fault,
+               "timing": exp_timing,
                "matmul": exp_matmul, "cost": exp_cost, "models": exp_models, "share": exp_share}
 
 

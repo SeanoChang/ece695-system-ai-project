@@ -238,7 +238,7 @@ def test_duplicate_is_not_merged_by_the_compiler(clean):
     size = {}
     for mode in (0, 1):
         k = gpu.k_std[grid](x, y.clone(), b.bad, b.cnt, b.list, b.xval, b.coef, b.marg, b.r,
-                            b.i0, b.i0, b.i0, b.i0, b.i0, b.i0, 0, 0, N,
+                            b.i0, b.i0, b.i0, b.i0, b.i0, b.i0, b.i0, 0, 0, -1, 0, N,
                             MODE=mode, FUSED=True, INJ=False, BLOCK=b.block, **b.const)
         ptx = getattr(k, "asm", {}).get("ptx")
         if ptx is None:
@@ -294,3 +294,107 @@ def test_cost_stages_are_not_removed_by_the_compiler_and_end_at_rb_list(clean):
     assert regs[-1] == ref.n_regs and k.n_spills == 0, (regs, ref.n_regs)
 
 
+def sm_faults(b, bad_sm, seed=7):
+    """A fault in the FP32 output of every element (bits 13-30), active only where the SM is bad_sm."""
+    rng = np.random.default_rng(seed)
+    f = b.faults(N, bad_sm=bad_sm)
+    f.fo[:] = torch.tensor((1 << rng.integers(13, 31, N)).astype(np.int32), device=DEV)
+    return f
+
+
+def fault_effect(b, x, y, seed=7):
+    """Where the masks of sm_faults change the stored output, if they hit the first computation."""
+    f = sm_faults(b, -1, seed)
+    yf, _ = run(b, "none", x, faults=f)
+    return bits(yf) != bits(y)
+
+
+def per_element(b, per_block):
+    return np.repeat(per_block.cpu().numpy(), b.block)[:N]
+
+
+def a_bad_sm(b, x):
+    """The SM that computed block 1 in one launch: an SM that the kernels really use."""
+    f = b.faults(N)
+    run(b, "none", x, faults=f)
+    sm = f.sm.cpu().numpy()
+    assert (sm >= 0).all()                          # every block recorded its SM
+    return int(sm[1])
+
+
+def test_sm_fault_changes_only_outputs_computed_on_the_bad_sm(clean):
+    b, x, y = clean
+    bad = a_bad_sm(b, x)
+    f = sm_faults(b, bad)
+    yf, _ = run(b, "none", x, faults=f)
+    on_bad = per_element(b, f.sm) == bad
+    changed = bits(yf) != bits(y)
+    assert on_bad.any() and not changed[~on_bad].any()
+    assert changed.sum() > on_bad.sum() // 2
+
+
+def test_fused_dup_misses_an_sm_fault_and_route_b_catches_it_on_certified_outputs(clean):
+    b, x, y = clean
+    bad = a_bad_sm(b, x)
+    eff = fault_effect(b, x, y)
+    f = sm_faults(b, bad)
+    yf, c = run(b, "dup", x, faults=f)
+    assert (bits(yf) != bits(y)).sum() > 100 and c["bad"] == 0     # both copies ran on the bad SM
+    for variant in ("rb_list", "rb_sum"):
+        f = sm_faults(b, bad)
+        yf, _ = run(b, variant, x, faults=f)
+        changed, ok, flag = bits(yf) != bits(y), f.ok.cpu().numpy() > 0, f.flag.cpu().numpy() > 0
+        assert (changed & ok).sum() > 100
+        # The table check runs on no SM's GELU: on certified outputs it flags exactly the changed ones.
+        # Uncertified outputs go to the second pass; a second pass on the bad SM recomputes a wrong value
+        # and flags a correct output. A flag can only appear where the fault changes the output.
+        assert not (flag & ~eff).any()
+        if variant == "rb_list":
+            assert np.array_equal(flag & ok, changed & ok)
+        else:
+            assert not (flag & ok).any()            # rb_sum checks certified outputs through d only
+            wrong = np.pad(changed & ok, (0, -N % b.block)).reshape(-1, b.block).any(1)
+            assert np.array_equal(f.d.cpu().numpy() != 0, wrong)
+        if INTERP:
+            # The second pass: list entry k is recomputed by program k // BLOCK (fewer than FB_GRID * BLOCK
+            # entries), whose SM in the interpreter is that program id mod SIM_SMS.
+            count = b.counts()["uncertified"]
+            assert 0 < count < gpu.FB_GRID * b.block
+            idx = b.list[:count].cpu().numpy()
+            pass_bad = np.zeros(N, bool)
+            pass_bad[idx] = (np.arange(count) // b.block) % gpu.SIM_SMS == bad
+            first_bad = per_element(b, f.sm) == bad
+            assert pass_bad.any() and (first_bad & ~ok).any()
+            assert np.array_equal(flag & ~ok, eff & ~ok & (first_bad != pass_bad))
+
+
+@pytest.mark.parametrize("shifted", (False, True))
+def test_separate_dup_catches_an_sm_fault_exactly_where_its_check_ran_elsewhere(clean, shifted):
+    b, x, y = clean
+    bad = a_bad_sm(b, x)
+    nb = -(-N // b.block)
+    f = sm_faults(b, bad)
+    yf, _ = run(b, "none", x, faults=f)             # the faulty kernel; its fault stays in yf
+    changed = bits(yf) != bits(y)
+    f2 = sm_faults(b, bad)                          # the same masks: the checker's copy is faulty on bad too
+    b.run("dup", x, yf, fused=False, faults=f2, shift=nb // 2 if shifted else 0)
+    first_bad = per_element(b, f.sm) == bad
+    check_bad = per_element(b, f2.sm2) == bad
+    eff = fault_effect(b, x, y)
+    # A flag exactly where the fault changes the output and one of the two computations ran on the bad SM:
+    # a wrong output checked elsewhere (caught), or a correct output checked on the bad SM (a false alarm
+    # from the defective checker). Both on the bad SM: the same wrong value twice, missed.
+    assert np.array_equal(f2.flag.cpu().numpy() > 0, eff & (first_bad != check_bad))
+    caught = changed & ~check_bad
+    if INTERP:                                      # the interpreter's SM is the program id mod 8
+        assert caught.any() == shifted
+
+
+@pytest.mark.skipif(INTERP, reason="needs a GPU")
+def test_recorded_sm_ids_are_real_sms(clean):
+    b, x, y = clean
+    f = b.faults(N)
+    run(b, "none", x, faults=f)
+    sm = f.sm.cpu().numpy()
+    assert sm.min() >= 0 and sm.max() < torch.cuda.get_device_properties(0).multi_processor_count
+    assert len(np.unique(sm)) > 1
