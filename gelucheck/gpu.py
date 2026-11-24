@@ -32,6 +32,7 @@ from . import route_b
 
 VARIANTS = ("none", "dup", "range", "rb_block", "rb_list", "rb_sum")
 MM_VARIANTS = ("matmul", "none", "dup", "rb_block", "rb_list", "rb_sum")
+COST_STAGES = ("none", "count", "load", "poly", "cell", "append", "list")   # see k_cost
 BLOCK = 1024           # elements per program in the standalone kernels
 TILE = 64              # the fused matmul uses TILE x TILE (or 16 x TILE) tiles
 FB_GRID = 40           # programs of the second pass; fixed, so the host never reads the list length
@@ -86,15 +87,26 @@ def _index(x, LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr):
 
 
 @triton.jit
-def _certify(x, coef_ptr, marg_ptr, LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr):
-    """Route B. Returns (certified, predicted FP16 bits). Mirrors route_b.certify operation for operation."""
+def _lookup(x, coef_ptr, marg_ptr, LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr):
+    """Route B, part 1: the interval of x, the offset t in it, its cubic's coefficients and its margin."""
     inr, j, t = _index(x, LO, H, NT)
     c0 = tl.load(coef_ptr + j * 4 + 0)
     c1 = tl.load(coef_ptr + j * 4 + 1)
     c2 = tl.load(coef_ptr + j * 4 + 2)
     c3 = tl.load(coef_ptr + j * 4 + 3)
     km = tl.load(marg_ptr + j)
-    p = ((c3 * t + c2) * t + c1) * t + c0
+    return inr, t, c0, c1, c2, c3, km
+
+
+@triton.jit
+def _poly(t, c0, c1, c2, c3):
+    """Route B, part 2: the cubic, in Horner form (the order of route_b.evaluate)."""
+    return ((c3 * t + c2) * t + c1) * t + c0
+
+
+@triton.jit
+def _cell(p, km, inr):
+    """Route B, part 3: certified if [p - km, p + km] lies strictly inside one FP16 rounding cell."""
     vb = _bits16(p.to(tl.float16))
     vf = _f16_from_bits(vb)
     n1 = _f16_from_bits(vb - 1)
@@ -103,6 +115,23 @@ def _certify(x, coef_ptr, marg_ptr, LO: tl.constexpr, H: tl.constexpr, NT: tl.co
     mhi = (vf + tl.maximum(n1, n2)) * 0.5
     ok = inr & ((p - mlo) > km) & ((mhi - p) > km) & ((vb & 0x7FFF) != 0)
     return ok, vb
+
+
+@triton.jit
+def _certify(x, coef_ptr, marg_ptr, LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr):
+    """Route B. Returns (certified, predicted FP16 bits). Mirrors route_b.certify operation for operation."""
+    inr, t, c0, c1, c2, c3, km = _lookup(x, coef_ptr, marg_ptr, LO, H, NT)
+    return _cell(_poly(t, c0, c1, c2, c3), km, inr)
+
+
+@triton.jit
+def _sink(v, zerof):
+    """False for every finite or infinite v, and for NaN: (v * 0.0) is 0 or NaN, and neither is > 1.
+
+    zerof is a run-time 0.0, so the compiler cannot prove the result false. A value passed through here
+    therefore stays computed: it is how a cost stage keeps work whose result nothing else uses.
+    """
+    return (v * zerof) > 1.0
 
 
 @triton.jit
@@ -192,6 +221,43 @@ def k_std(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr
             tl.atomic_add(bad_ptr, tl.sum(bad.to(tl.int32), axis=0))
         if INJ:
             tl.store(flag_ptr + offs, bad.to(tl.int32), mask=m)
+
+
+@triton.jit(do_not_specialize=["zerof", "n"])
+def k_cost(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr, zerof, n,
+           STAGE: tl.constexpr, LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr, BLOCK: tl.constexpr):
+    """Fused GELU plus the first STAGE parts of rb_list, to time each part (COST_STAGES[STAGE]).
+
+    0 none    GELU and store, as k_std "none"
+    1 count   + the alarm counter: one atomic per block (the host also resets the counters)
+    2 load    + interval index and the table loads (coefficients and margin)
+    3 poly    + the cubic
+    4 cell    + the rounding-cell test and the compare with the stored output
+    5 append  + the append of uncertified inputs to the list (stage 6, list, adds the second pass on the host)
+    Stages 1 to 3 pass their result through _sink, so the compiler keeps the work. From stage 4 on, the code
+    is that of k_std rb_list.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m, other=1.0)
+    yf = _gelu(x)
+    y = yf.to(tl.float16)
+    tl.store(y_ptr + offs, y, mask=m)
+    if STAGE >= 1:
+        bad = m & _sink(yf, zerof)
+        if STAGE >= 2:
+            inr, t, c0, c1, c2, c3, km = _lookup(x, coef_ptr, marg_ptr, LO, H, NT)
+            if STAGE == 2:
+                bad = bad | (m & inr & _sink(t + c0 + c1 + c2 + c3 + km, zerof))
+            if STAGE == 3:
+                bad = bad | (m & inr & _sink(_poly(t, c0, c1, c2, c3) + km, zerof))
+            if STAGE >= 4:
+                ok, vb = _cell(_poly(t, c0, c1, c2, c3), km, inr)
+                bad = m & ok & (vb != _bits16(y))
+                if STAGE >= 5:
+                    _append(m & (ok.to(tl.int32) == 0), offs, x, cnt_ptr, list_ptr, xval_ptr)
+        tl.atomic_add(bad_ptr, tl.sum(bad.to(tl.int32), axis=0))
 
 
 @triton.jit(do_not_specialize=["n"])
@@ -360,6 +426,20 @@ class Bench:
         if mode >= 4:
             k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, c.reshape(-1), self.bad, self.i0, self.i0,
                                    self.i0, 0, INJ=False, BLOCK=self.block)
+
+    def cost(self, stage, x, y):
+        """Launch the cost stage `stage` (a name in COST_STAGES) of fused GELU on x, storing y."""
+        s, n = COST_STAGES.index(stage), x.numel()
+        assert n <= self.n and x.dtype == torch.float32 and y.dtype == torch.float16 and x.dim() == y.dim() == 1
+        assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
+        if s:
+            self.ctr.zero_()
+        k_cost[(triton.cdiv(n, self.block),)](
+            x, y, self.bad, self.cnt, self.list, self.xval, self.coef, self.marg, 0.0, n,
+            STAGE=min(s, 5), BLOCK=self.block, **self.const)
+        if s == 6:
+            k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, self.i0, self.i0, self.i0, 0,
+                                   INJ=False, BLOCK=self.block)
 
     def counts(self):
         bad, unc = self.ctr.tolist()

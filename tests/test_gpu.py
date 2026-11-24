@@ -246,3 +246,35 @@ def test_duplicate_is_not_merged_by_the_compiler(clean):
         size[mode] = sum(1 for line in ptx.splitlines()
                          if line.strip() and not line.strip().startswith(("//", ".", "{", "}", "$")))
     assert size[1] > 1.5 * size[0], size
+
+
+@pytest.mark.parametrize("stage", gpu.COST_STAGES)
+def test_cost_stages_store_the_same_outputs_and_raise_no_false_alarm(clean, stage):
+    b, x, y = clean
+    y2 = torch.empty_like(y)
+    b.ctr.zero_()                                   # "none" has no counter: it must leave these at 0
+    b.cost(stage, x, y2)
+    c = b.counts()
+    assert np.array_equal(bits(y2), bits(y))
+    assert c["bad"] == 0
+    if stage in ("append", "list"):                 # the list holds exactly the inputs that rb_list lists
+        _, ref = run(b, "rb_list", x)
+        assert c["uncertified"] == ref["uncertified"] > 0
+
+
+@pytest.mark.skipif(INTERP, reason="needs compiled code")
+def test_cost_stages_are_not_removed_by_the_compiler(clean):
+    # Each stage must add instructions to the one before it. A stage whose result the compiler could
+    # prove unused would compile to the same code as the stage before, and its time would read as 0.
+    b, x, y = clean
+    grid = (-(-N // b.block),)
+    size = []
+    for s in range(6):
+        k = gpu.k_cost[grid](x, y.clone(), b.bad, b.cnt, b.list, b.xval, b.coef, b.marg, 0.0, N,
+                             STAGE=s, BLOCK=b.block, **b.const)
+        ptx = getattr(k, "asm", {}).get("ptx")
+        if ptx is None:
+            pytest.skip("this Triton version does not return the compiled kernel")
+        size.append(sum(1 for line in ptx.splitlines()
+                        if line.strip() and not line.strip().startswith(("//", ".", "{", "}", "$"))))
+    assert all(a < b2 for a, b2 in zip(size, size[1:])), size

@@ -5,12 +5,13 @@ Usage (one idle GPU; about 10 minutes, mostly the model downloads on the first r
     ... scripts/run_gpu.py --only clean,inject        run some experiments
     TRITON_INTERPRET=1 PYTHONPATH=. python scripts/run_gpu.py --quick --only clean,inject   (CPU, tiny, logic only)
 
-Experiments: clean, exhaustive, inject, timing, matmul, models, share. One that fails is reported; the rest run.
+Experiments: clean, exhaustive, inject, timing, matmul, cost, models, share. One that fails is reported; the rest run.
 """
 import argparse
 import pathlib
 import sys
 import traceback
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -233,11 +234,29 @@ def exp_inject(args):
           f"(theory: about {blocks / 65537:.2f})")
 
 
-def bench(fn, args):
+class Time(NamedTuple):
+    """Kernel time in ms: the median over the repeats, and the smallest and largest repeat."""
+    med: float
+    lo: float
+    hi: float
+
+    def us(self):
+        return f"{self.med * 1e3:9.1f} us ({self.lo * 1e3:.1f}-{self.hi * 1e3:.1f})"
+
+
+def bench_all(fns, args):
+    """Time each function args.repeat times, in turns, so that a burst of load from another job on the GPU
+    falls on one repeat of every function instead of on all repeats of one. Each repeat is a do_bench mean
+    over about 200 ms. Every function must already be compiled (called once)."""
     if args.quick:
-        fn()
-        return float("nan")
-    return triton.testing.do_bench(fn, warmup=25, rep=200)
+        for fn in fns.values():
+            fn()
+        return {k: Time(float("nan"), float("nan"), float("nan")) for k in fns}
+    s = {k: [] for k in fns}
+    for _ in range(args.repeat):
+        for k, fn in fns.items():
+            s[k].append(triton.testing.do_bench(fn, warmup=25, rep=200))
+    return {k: Time(float(np.median(v)), min(v), max(v)) for k, v in s.items()}
 
 
 def exp_timing(args):
@@ -245,22 +264,27 @@ def exp_timing(args):
     print("\nEvery checked variant includes the reset of its 8-byte counters (one tiny launch).")
     print("rb_list and rb_sum include the second pass. A 'separate' row is the time of the check without the GELU")
     print("kernel: the checker kernel, its counter reset and, for rb_list and rb_sum, the second pass.")
+    print(f"Each time: median of {args.repeat} repeats taken in turns (smallest-largest in brackets).")
     for tokens in (16,) if args.quick else (16, 512, 4096):
         n = tokens * 4096
         b = gpu.Bench(n)
         x, y = draw("standard normal", n, 2), half(n)
-        b.run("none", x, y)
-        t = {"none": bench(lambda: b.run("none", x, y), args)}
+        fns = {"none": lambda: b.run("none", x, y)}
         for v in CHECKED:
-            t[v] = bench(lambda: b.run(v, x, y), args)
+            fns[v] = lambda v=v: b.run(v, x, y)
         for v in SEPARATE:
-            t["separate " + v] = bench(lambda: b.run(v, x, y, fused=False), args)
-        t["torch F.gelu, FP32 out"] = bench(lambda: F.gelu(x), args)
-        print(f"\n  {tokens} tokens ({n:,} elements); unprotected GELU {t['none'] * 1e3:.1f} us "
-              f"= {6 * n / (t['none'] * 1e-3) / 1e9:.0f} GB/s")
+            fns["separate " + v] = lambda v=v: b.run(v, x, y, fused=False)
+        fns["torch F.gelu, FP32 out"] = lambda: F.gelu(x)
+        for fn in fns.values():                      # compiles every kernel; y ends as the clean output
+            fn()
+        b.run("none", x, y)
+        t = bench_all(fns, args)
+        base = t["none"].med
+        print(f"\n  {tokens} tokens ({n:,} elements); unprotected GELU {base * 1e3:.1f} us "
+              f"= {6 * n / (base * 1e-3) / 1e9:.0f} GB/s")
         for name, v in t.items():
-            extra = f"   none + checker x{(t['none'] + v) / t['none']:.2f}" if name.startswith("separate") else ""
-            print(f"    {name:24s} {v * 1e3:9.1f} us   x{v / t['none']:.2f} of unprotected{extra}")
+            extra = f"   none + checker x{(base + v.med) / base:.2f}" if name.startswith("separate") else ""
+            print(f"    {name:24s} {v.us()}   x{v.med / base:.2f} of unprotected{extra}")
 
 
 def exp_matmul(args):
@@ -273,22 +297,62 @@ def exp_matmul(args):
         c = torch.empty(M, N, dtype=torch.float16, device=DEV)
         b = gpu.Bench(M * N)
         print(f"\n  M = {M} tokens")
-        t, note = {}, {}
+        fns, note = {}, {}
         for v in gpu.MM_VARIANTS:
             try:
                 b.mm(v, a, w, c)
                 if v not in ("matmul", "none"):      # these two have no check, so no counters
                     cnt = b.counts()
                     note[v] = f"   false alarms {cnt['bad']}, second pass / recomputed {cnt['uncertified']}"
-                t[v] = bench(lambda: b.mm(v, a, w, c), args)
+                fns[v] = lambda v=v: b.mm(v, a, w, c)
             except Exception as err:                 # one variant that does not compile must not stop the rest
                 note[v] = f"failed: {type(err).__name__}: {str(err)[:200]}"
-        base = t.get("none", float("nan"))
+        t = bench_all(fns, args)
+        base = t["none"].med if "none" in t else float("nan")
         for v in gpu.MM_VARIANTS:
             if v in t:
-                print(f"    {v:8s} {t[v] * 1e3:9.1f} us   x{t[v] / base:.3f} of matmul + GELU{note.get(v, '')}")
+                print(f"    {v:8s} {t[v].us()}   x{t[v].med / base:.3f} of matmul + GELU{note.get(v, '')}")
             else:
                 print(f"    {v:8s} {note[v]}")
+
+
+def exp_cost(args):
+    """Where Route B's time goes: fused GELU plus one more part of rb_list at each step."""
+    labels = {"none": "GELU and store (unprotected)",
+              "count": "+ alarm counter (reset, 1 atomic per block)",
+              "load": "+ interval index and table loads",
+              "poly": "+ cubic",
+              "cell": "+ rounding-cell test and compare",
+              "append": "+ append uncertified inputs to the list",
+              "list": "+ second pass over the list (= rb_list)"}
+    print("\nA step's cost is its median minus the median of the step before. Steps 'count' to 'poly' keep")
+    print("their work alive through a multiply by a run-time 0.0; 'cell' onwards is the code of rb_list.")
+    print(f"Each time: median of {args.repeat} repeats taken in turns (smallest-largest in brackets).")
+    for tokens in (16,) if args.quick else (512, 4096):
+        n = tokens * 4096
+        b = gpu.Bench(n)
+        x, y = draw("standard normal", n, 2), half(n)
+        fns, alarms = {}, {}
+        for s in gpu.COST_STAGES:
+            b.cost(s, x, y)                          # compiles; and the clean run must raise no alarm
+            alarms[s] = b.counts()["bad"] if s != "none" else 0
+            fns[s] = lambda s=s: b.cost(s, x, y)
+        for v in ("dup", "rb_block", "rb_list"):
+            b.run(v, x, y)
+            fns[v] = lambda v=v: b.run(v, x, y)
+        t = bench_all(fns, args)
+        base = t["none"].med
+        print(f"\n  {tokens} tokens ({n:,} elements); false alarms over all steps: {sum(alarms.values())}")
+        print(f"    {'step':46s} {'time':>26s}   {'step cost':>10s}  {'of unprotected':>14s}")
+        prev = None
+        for s in gpu.COST_STAGES:
+            step = "" if prev is None else f"{(t[s].med - t[prev].med) * 1e3:+8.1f} us  {(t[s].med - t[prev].med) / base:+13.2f}"
+            print(f"    {labels[s]:46s} {t[s].us():>26s}   {step}")
+            prev = s
+        print(f"    k_std for comparison: dup {t['dup'].us()}, rb_block {t['rb_block'].us()}, "
+              f"rb_list {t['rb_list'].us()}")
+        print(f"    estimate of the certify step as rb_block - dup (every block recomputes): "
+              f"{(t['rb_block'].med - t['dup'].med) * 1e3:+.1f} us")
 
 
 def capture(model, call):
@@ -382,13 +446,14 @@ def exp_share(args):
 
 
 EXPERIMENTS = {"clean": exp_clean, "exhaustive": exp_exhaustive, "inject": exp_inject, "timing": exp_timing,
-               "matmul": exp_matmul, "models": exp_models, "share": exp_share}
+               "matmul": exp_matmul, "cost": exp_cost, "models": exp_models, "share": exp_share}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=",".join(EXPERIMENTS), help="comma-separated experiments")
     ap.add_argument("--quick", action="store_true", help="tiny sizes and no timing: a test of the script itself")
+    ap.add_argument("--repeat", type=int, default=5, help="timing repeats per kernel; the median is reported")
     args = ap.parse_args()
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU interpreter (no real timing)"
     print(f"torch {torch.__version__} | triton {triton.__version__} | {gpu_name}{' | QUICK' if args.quick else ''}")
