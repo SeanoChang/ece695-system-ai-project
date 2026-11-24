@@ -32,7 +32,7 @@ from . import route_b
 
 VARIANTS = ("none", "dup", "range", "rb_block", "rb_list", "rb_sum")
 MM_VARIANTS = ("matmul", "none", "dup", "rb_block", "rb_list", "rb_sum")
-COST_STAGES = ("none", "count", "load", "poly", "cell", "append", "list")   # see k_cost
+COST_STAGES = ("none", "count", "predict", "cell", "append", "list")   # see k_cost
 BLOCK = 1024           # elements per program in the standalone kernels
 TILE = 64              # the fused matmul uses TILE x TILE (or 16 x TILE) tiles
 FB_GRID = 40           # programs of the second pass; fixed, so the host never reads the list length
@@ -125,16 +125,6 @@ def _certify(x, coef_ptr, marg_ptr, LO: tl.constexpr, H: tl.constexpr, NT: tl.co
 
 
 @triton.jit
-def _sink(v, zerof):
-    """False for every finite or infinite v, and for NaN: (v * 0.0) is 0 or NaN, and neither is > 1.
-
-    zerof is a run-time 0.0, so the compiler cannot prove the result false. A value passed through here
-    therefore stays computed: it is how a cost stage keeps work whose result nothing else uses.
-    """
-    return (v * zerof) > 1.0
-
-
-@triton.jit
 def _append(unc, idx, val, cnt_ptr, list_ptr, xval_ptr):
     """Append (index, GELU input) where unc is true to the global list. One atomic per program."""
     u = unc.to(tl.int32)
@@ -223,43 +213,42 @@ def k_std(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr
             tl.store(flag_ptr + offs, bad.to(tl.int32), mask=m)
 
 
-@triton.jit(do_not_specialize=["zerof", "n"])
-def k_cost(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr, zerof, n,
+@triton.jit(do_not_specialize=["zero", "n"])
+def k_cost(x_ptr, y_ptr, bad_ptr, cnt_ptr, list_ptr, xval_ptr, coef_ptr, marg_ptr, zero, n,
            STAGE: tl.constexpr, LO: tl.constexpr, H: tl.constexpr, NT: tl.constexpr, BLOCK: tl.constexpr):
     """Fused GELU plus the first STAGE parts of rb_list, to time each part (COST_STAGES[STAGE]).
 
-    0 none    GELU and store, as k_std "none"
-    1 count   + the alarm counter: one atomic per block (the host also resets the counters)
-    2 load    + interval index and the table loads (coefficients and margin)
-    3 poly    + the cubic
-    4 cell    + the rounding-cell test and the compare with the stored output
-    5 append  + the append of uncertified inputs to the list (stage 6, list, adds the second pass on the host)
-    Each stage is the stage before plus one part: every term of the alarm `bad` stays in all later stages.
-    Stages 1 to 3 add a term through _sink, so the compiler keeps their work; each such term costs a multiply,
-    a compare and an OR per element. Stages 4 and up are therefore rb_list plus those three terms; the cost
-    experiment also times k_std rb_list, and the difference is their cost.
+    0 none     GELU and store, as k_std "none"
+    1 count    + the alarm counter: one atomic per block (the host also resets the counters)
+    2 predict  + interval index, table loads and the cubic; every in-range output is compared with its
+               prediction (no cell test, so this stage flags the outputs it could not certify)
+    3 cell     + the margin and the rounding-cell test; only certified outputs are compared
+    4 append   + the append of uncertified inputs to the list: the code of k_std rb_list
+               (stage 5, list, adds the second pass on the host)
+    Every stage uses its results in a real check, as rb_list does; no stage adds code only to keep work
+    alive, so register use and occupancy at each stage are those of a real kernel. The lookup and the
+    cubic are one step: the cubic alone has no use without a prediction to compare.
+    zero is a run-time 0 added to the counter, so the atomic of stage 1 is not folded away.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     m = offs < n
     x = tl.load(x_ptr + offs, mask=m, other=1.0)
-    yf = _gelu(x)
-    y = yf.to(tl.float16)
+    y = _gelu(x).to(tl.float16)
     tl.store(y_ptr + offs, y, mask=m)
     if STAGE >= 1:
-        bad = m & _sink(yf, zerof)
+        bad = offs < 0                               # all false: stage 1 times the counter alone
         if STAGE >= 2:
             inr, t, c0, c1, c2, c3, km = _lookup(x, coef_ptr, marg_ptr, LO, H, NT)
-            bad = bad | (m & inr & _sink(t + c0 + c1 + c2 + c3 + km, zerof))
-            if STAGE >= 3:
-                p = _poly(t, c0, c1, c2, c3)
-                bad = bad | (m & inr & _sink(p, zerof))
+            p = _poly(t, c0, c1, c2, c3)
+            if STAGE == 2:
+                bad = m & inr & (_bits16(p.to(tl.float16)) != _bits16(y))
+            else:
+                ok, vb = _cell(p, km, inr)
+                bad = m & ok & (vb != _bits16(y))
                 if STAGE >= 4:
-                    ok, vb = _cell(p, km, inr)
-                    bad = bad | (m & ok & (vb != _bits16(y)))
-                    if STAGE >= 5:
-                        _append(m & (ok.to(tl.int32) == 0), offs, x, cnt_ptr, list_ptr, xval_ptr)
-        tl.atomic_add(bad_ptr, tl.sum(bad.to(tl.int32), axis=0))
+                    _append(m & (ok.to(tl.int32) == 0), offs, x, cnt_ptr, list_ptr, xval_ptr)
+        tl.atomic_add(bad_ptr, tl.sum(bad.to(tl.int32), axis=0) + zero)
 
 
 @triton.jit(do_not_specialize=["n"])
@@ -396,7 +385,9 @@ class Bench:
         return Faults(z(n), z(n), z(n), z(triton.cdiv(n, self.block)), z(n), z(n), persist)
 
     def run(self, variant, x, y, fused=True, faults=None):
-        """Launch the kernels of one variant. Returns nothing: read counts() afterwards."""
+        """Launch the kernels of one variant; read counts() afterwards.
+
+        Returns the compiled k_std kernel (its n_regs and n_spills on a GPU; None in the interpreter)."""
         n, mode, f = x.numel(), VARIANTS.index(variant), faults
         assert n <= self.n and x.dtype == torch.float32 and y.dtype == torch.float16 and x.dim() == y.dim() == 1
         assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
@@ -405,13 +396,14 @@ class Bench:
             self.ctr.zero_()
         fe, fo, flag, d, ok, vb = (f.fe, f.fo, f.flag, f.d, f.ok, f.vb) if f else (self.i0,) * 6
         persist = int(f.persist) if f else 0
-        k_std[(triton.cdiv(n, self.block),)](
+        k = k_std[(triton.cdiv(n, self.block),)](
             x, y, self.bad, self.cnt, self.list, self.xval, self.coef, self.marg, self.r,
             fe, fo, flag, d, ok, vb, 0, persist, n,
             MODE=mode, FUSED=fused, INJ=f is not None, BLOCK=self.block, **self.const)
         if mode >= 4:
             k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, fe, fo, flag, persist,
                                    INJ=f is not None, BLOCK=self.block)
+        return k
 
     def mm(self, variant, a, b, c):
         """C = GELU(A @ B) with the check fused into the matmul epilogue."""
@@ -430,18 +422,21 @@ class Bench:
                                    self.i0, 0, INJ=False, BLOCK=self.block)
 
     def cost(self, stage, x, y):
-        """Launch the cost stage `stage` (a name in COST_STAGES) of fused GELU on x, storing y."""
+        """Launch the cost stage `stage` (a name in COST_STAGES) of fused GELU on x, storing y.
+
+        Returns the compiled main kernel (its n_regs and n_spills on a GPU; None in the interpreter)."""
         s, n = COST_STAGES.index(stage), x.numel()
         assert n <= self.n and x.dtype == torch.float32 and y.dtype == torch.float16 and x.dim() == y.dim() == 1
         assert x.is_contiguous() and y.is_contiguous() and y.numel() == n, "the kernels index with stride 1"
         if s:
             self.ctr.zero_()
-        k_cost[(triton.cdiv(n, self.block),)](
-            x, y, self.bad, self.cnt, self.list, self.xval, self.coef, self.marg, 0.0, n,
-            STAGE=min(s, 5), BLOCK=self.block, **self.const)
-        if s == 6:
+        k = k_cost[(triton.cdiv(n, self.block),)](
+            x, y, self.bad, self.cnt, self.list, self.xval, self.coef, self.marg, 0, n,
+            STAGE=min(s, 4), BLOCK=self.block, **self.const)
+        if s == 5:
             k_fallback[(FB_GRID,)](self.xval, self.list, self.cnt, y, self.bad, self.i0, self.i0, self.i0, 0,
                                    INJ=False, BLOCK=self.block)
+        return k
 
     def counts(self):
         bad, unc = self.ctr.tolist()

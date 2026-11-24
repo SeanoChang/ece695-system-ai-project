@@ -320,42 +320,43 @@ def exp_cost(args):
     """Where Route B's time goes: fused GELU plus one more part of rb_list at each step."""
     labels = {"none": "GELU and store (unprotected)",
               "count": "+ alarm counter (reset, 1 atomic per block)",
-              "load": "+ interval index and table loads",
-              "poly": "+ cubic",
-              "cell": "+ rounding-cell test and compare",
-              "append": "+ append uncertified inputs to the list",
+              "predict": "+ table lookup and cubic, compare all",
+              "cell": "+ margin and cell test, compare certified",
+              "append": "+ append uncertified inputs (= rb_list kernel)",
               "list": "+ second pass over the list (= rb_list)"}
-    print("\nA step's cost is its median minus the median of the step before. Each step adds one part to the")
-    print("step before and keeps all of it. Steps 'count' to 'poly' keep their work alive through a multiply by")
-    print("a run-time 0.0, a compare and an OR per element; the ladder's last step is rb_list plus those three.")
+    print("\nEach step adds one part to the step before and uses it in a real check; no code is added only to")
+    print("keep work alive. A step's cost is its median minus the median of the step before; the range in")
+    print("brackets is the widest it can be from the two steps' smallest and largest repeats. 'regs' is the")
+    print("registers per thread of the main kernel (fewer blocks fit on an SM as it grows).")
     print(f"Each time: median of {args.repeat} repeats taken in turns (smallest-largest in brackets).")
     for tokens in (16,) if args.quick else (512, 4096):
         n = tokens * 4096
         b = gpu.Bench(n)
         x, y = draw("standard normal", n, 2), half(n)
-        fns, alarms = {}, {}
+        fns, alarms, regs = {}, {}, {}
         for s in gpu.COST_STAGES:
-            b.cost(s, x, y)                          # compiles; and the clean run must raise no alarm
+            k = b.cost(s, x, y)                      # compiles; and gives the alarms of a clean run
             alarms[s] = b.counts()["bad"] if s != "none" else 0
+            regs[s] = getattr(k, "n_regs", None)
             fns[s] = lambda s=s: b.cost(s, x, y)
-        for v in ("dup", "rb_block", "rb_list"):
-            b.run(v, x, y)
+        for v in ("dup", "rb_list"):
+            regs[v] = getattr(b.run(v, x, y), "n_regs", None)
             fns[v] = lambda v=v: b.run(v, x, y)
         t = bench_all(fns, args)
         base = t["none"].med
-        print(f"\n  {tokens} tokens ({n:,} elements); false alarms over all steps: {sum(alarms.values())}")
-        print(f"    {'step':46s} {'time':>26s}   {'step cost':>10s}  {'of unprotected':>14s}")
+        print(f"\n  {tokens} tokens ({n:,} elements); alarms on clean data: 'predict' {alarms['predict']} (outputs "
+              f"it cannot certify), all other steps {sum(alarms.values()) - alarms['predict']}")
+        print(f"    {'step':48s} {'regs':>4s} {'time':>26s}   {'step cost (range)':>28s} {'of unprotected':>14s}")
         prev = None
         for s in gpu.COST_STAGES:
-            step = "" if prev is None else f"{(t[s].med - t[prev].med) * 1e3:+8.1f} us  {(t[s].med - t[prev].med) / base:+13.2f}"
-            print(f"    {labels[s]:46s} {t[s].us():>26s}   {step}")
+            step = ""
+            if prev is not None:
+                d, lo, hi = t[s].med - t[prev].med, t[s].lo - t[prev].hi, t[s].hi - t[prev].lo
+                step = f"{d * 1e3:+8.1f} us ({lo * 1e3:+.1f}..{hi * 1e3:+.1f})   {d / base:+10.2f}"
+            print(f"    {labels[s]:48s} {str(regs[s]):>4s} {t[s].us():>26s}   {step}")
             prev = s
-        print(f"    k_std for comparison: dup {t['dup'].us()}, rb_block {t['rb_block'].us()}, "
-              f"rb_list {t['rb_list'].us()}")
-        print(f"    cost of the three keep-alive terms (last step - k_std rb_list): "
-              f"{(t['list'].med - t['rb_list'].med) * 1e3:+.1f} us")
-        print(f"    estimate of the certify step as rb_block - dup (every block recomputes): "
-              f"{(t['rb_block'].med - t['dup'].med) * 1e3:+.1f} us")
+        print(f"    k_std for comparison: dup {t['dup'].us()}, {regs['dup']} regs; "
+              f"rb_list {t['rb_list'].us()}, {regs['rb_list']} regs")
 
 
 def capture(model, call):
